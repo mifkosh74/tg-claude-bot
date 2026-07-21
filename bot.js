@@ -8,7 +8,8 @@ import "dotenv/config";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const STATE_FILE = join(__dirname, "state.json");
 
-if (!process.env.BOT_TOKEN) {
+const BOT_TOKEN = process.env.BOT_TOKEN || process.env.API_TOKEN; // bothost кладёт токен в API_TOKEN
+if (!BOT_TOKEN) {
   console.error("BOT_TOKEN не задан. Создай файл .env со строкой BOT_TOKEN=токен_от_BotFather");
   process.exit(1);
 }
@@ -89,7 +90,7 @@ async function askClaude(chatId, userText) {
 }
 
 // --- Telegram ---
-const bot = new Bot(process.env.BOT_TOKEN);
+const bot = new Bot(BOT_TOKEN);
 let me;
 
 function isOwner(ctx) {

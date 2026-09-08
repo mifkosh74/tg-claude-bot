@@ -1,0 +1,338 @@
+// crosspost-inbox.js — приём заявок на дубль пересылкой поста боту в личку.
+//
+// Николай пересылает пост из канала @MakedHeadBot в личку — это команда
+// «продублируй в VK и MAX». Бот отвечает «принял», ждёт «+», публикует,
+// отписывается ссылками.
+//
+// Почему через подтверждение: 03.09.2026 на площадки уехал не тот пост.
+// Пересылка = намерение, «+» = разрешение. Снимается CROSSPOST_AUTO=1.
+//
+// Что бот делать НЕ умеет и не сможет: канал в VK-Мессенджере
+// (vk.ru/im/channels/-235311764) закрыт для любых API — только руками через
+// браузер. Поэтому после публикации бот сам напоминает про него.
+
+import { readFileSync, writeFileSync, existsSync } from "fs";
+import { join } from "path";
+import {
+  loadCrosspostConfig,
+  describeConfig,
+  isSourceChannel,
+  collectMedia,
+  postVk,
+  postMax,
+  checkPlatforms,
+} from "./crosspost.js";
+
+const CONFIRM = new Set(["+", "да", "ок", "окей", "ok", "go", "поехали", "дубль", "публикуй"]);
+const CANCEL = new Set(["-", "нет", "отмена", "стоп", "cancel", "не надо"]);
+
+const GROUP_WINDOW_MS = 2500; // сколько ждём остальные сообщения медиагруппы
+const CONFIRM_WINDOW_MS = 30 * 60 * 1000; // «ок» старше получаса — это уже разговор с Клодом, а не подтверждение
+const JOB_TTL_MS = 24 * 60 * 60 * 1000;
+
+export function registerCrosspost(bot, { botToken, isOwner, dir }) {
+  const cfg = loadCrosspostConfig();
+  const QUEUE_FILE = join(dir, "crosspost_queue.json");
+
+  const missing = describeConfig(cfg);
+  if (missing.length) {
+    console.log("Кросспостинг настроен не полностью, не хватает: " + missing.join("; "));
+  } else {
+    console.log(`Кросспостинг готов: VK ${cfg.vk.groupId}, MAX ${cfg.max.chatId}, источник @${cfg.channel.username || cfg.channel.id}`);
+  }
+
+  const auto = process.env.CROSSPOST_AUTO === "1";
+
+  let jobs = [];
+  try {
+    if (existsSync(QUEUE_FILE)) jobs = JSON.parse(readFileSync(QUEUE_FILE, "utf8"));
+  } catch (e) {
+    console.error("Очередь дублей не прочиталась, начинаю с пустой:", e.message);
+  }
+  const saveJobs = () => {
+    try {
+      writeFileSync(QUEUE_FILE, JSON.stringify(jobs.slice(-50), null, 1));
+    } catch (e) {
+      console.error("Очередь дублей не сохранилась:", e.message);
+    }
+  };
+
+  const pending = () =>
+    jobs.filter((j) => j.status === "pending" && Date.now() - j.createdAt < JOB_TTL_MS);
+  const lastDone = () => [...jobs].reverse().find((j) => j.status === "done");
+
+  const groupBuffers = new Map(); // media_group_id -> { items, text, timer, srcId }
+  let lastForward = null; // последняя пересылка ЛЮБОГО происхождения — для команды /dubl
+  let publishing = false;
+
+  // ---------- разбор сообщения ----------
+
+  function mediaFromMessage(msg) {
+    const out = [];
+    const id = msg.message_id;
+    if (msg.photo?.length) {
+      const best = msg.photo[msg.photo.length - 1]; // размеры отсортированы по возрастанию
+      out.push({ kind: "photo", fileId: best.file_id, fileSize: best.file_size, filename: `photo_${id}.jpg` });
+    }
+    if (msg.video) {
+      out.push({
+        kind: "video",
+        fileId: msg.video.file_id,
+        fileSize: msg.video.file_size,
+        filename: msg.video.file_name || `video_${id}.mp4`,
+      });
+    }
+    if (msg.animation) {
+      out.push({ kind: "video", fileId: msg.animation.file_id, fileSize: msg.animation.file_size, filename: `animation_${id}.mp4` });
+    }
+    if (msg.document) {
+      const mime = msg.document.mime_type || "";
+      const kind = mime.startsWith("image/") ? "photo" : mime.startsWith("video/") ? "video" : null;
+      if (kind) {
+        out.push({ kind, fileId: msg.document.file_id, fileSize: msg.document.file_size, filename: msg.document.file_name || `document_${id}` });
+      }
+    }
+    return out;
+  }
+
+  function originOf(msg) {
+    const o = msg.forward_origin;
+    if (o?.type === "channel") return o.chat;
+    if (msg.forward_from_chat) return msg.forward_from_chat; // старый формат Bot API
+    return null;
+  }
+
+  function describeJob(job) {
+    const photos = job.media.filter((m) => m.kind === "photo").length;
+    const videos = job.media.filter((m) => m.kind === "video").length;
+    const parts = [`текст ${job.text.length} симв.`];
+    if (photos) parts.push(`${photos} фото`);
+    if (videos) parts.push(`${videos} видео`);
+    if (!photos && !videos) parts.push("без вложений");
+    return parts.join(", ");
+  }
+
+  async function enqueue(ctx, { text, media, srcId }) {
+    if (!text.trim() && !media.length) {
+      await ctx.reply("В пересылке нет ни текста, ни вложений — дублировать нечего.");
+      return;
+    }
+    if (jobs.some((j) => j.srcId && j.srcId === srcId && j.status !== "cancelled")) {
+      await ctx.reply(`Пост ${srcId} у меня уже был. Пересылай заново только если предыдущая заявка отменена.`);
+      return;
+    }
+    const job = {
+      id: Date.now(),
+      createdAt: Date.now(),
+      chatId: ctx.chat.id,
+      srcId,
+      text,
+      media,
+      status: "pending",
+      results: {},
+    };
+    jobs.push(job);
+    saveJobs();
+
+    const platforms = [cfg.vkReady && "VK", cfg.maxReady && "MAX"].filter(Boolean).join(" и ");
+    if (!platforms) {
+      job.status = "cancelled";
+      saveJobs();
+      await ctx.reply("Принял бы, но площадки не настроены: " + describeConfig(cfg).join("; "));
+      return;
+    }
+    if (auto) {
+      await ctx.reply(`Принял (${describeJob(job)}). Режим без подтверждения — публикую в ${platforms}.`);
+      job.status = "approved";
+      saveJobs();
+      void runPending(ctx);
+      return;
+    }
+    await ctx.reply(
+      `Принял на дубль: ${describeJob(job)}.\n` +
+        `Публикую в ${platforms} — подтверди плюсом (+). Передумал — минус (-).`
+    );
+  }
+
+  // Пересылка альбома приходит несколькими сообщениями с общим media_group_id —
+  // копим их пару секунд и собираем в одну заявку.
+  function bufferGroup(ctx, msg, text, media) {
+    const key = msg.media_group_id;
+    const buf = groupBuffers.get(key) || { items: [], text: "", srcId: null };
+    buf.items.push(...media);
+    if (text && !buf.text) buf.text = text;
+    if (!buf.srcId) buf.srcId = msg.forward_origin?.message_id || msg.forward_from_message_id || null;
+    clearTimeout(buf.timer);
+    buf.timer = setTimeout(() => {
+      groupBuffers.delete(key);
+      enqueue(ctx, { text: buf.text, media: buf.items, srcId: buf.srcId }).catch((e) =>
+        console.error("Ошибка постановки альбома в очередь:", e)
+      );
+    }, GROUP_WINDOW_MS);
+    groupBuffers.set(key, buf);
+  }
+
+  // ---------- публикация ----------
+
+  async function runPending(ctx) {
+    if (publishing) return;
+    publishing = true;
+    try {
+      const targets = jobs.filter((j) => j.status === "approved");
+      for (const job of targets) {
+        await publishJob(ctx, job);
+      }
+    } catch (e) {
+      console.error("Ошибка публикации:", e);
+      await ctx.reply("Публикация упала: " + e.message).catch(() => {});
+    } finally {
+      publishing = false;
+    }
+  }
+
+  async function publishJob(ctx, job) {
+    await ctx.reply("Публикую…");
+    const { media, warnings } = await collectMedia(botToken, job.media);
+    const lines = [];
+    const allWarnings = [...warnings];
+
+    if (cfg.vkReady) {
+      try {
+        const r = await postVk(cfg, job.text, media);
+        job.results.vk = r.url;
+        job.vkPostId = r.postId;
+        lines.push("VK: " + r.url);
+        allWarnings.push(...r.warnings);
+      } catch (e) {
+        job.results.vk = "ERROR: " + e.message;
+        lines.push("VK: не вышло — " + e.message);
+      }
+    }
+    if (cfg.maxReady) {
+      try {
+        const r = await postMax(cfg, job.text, media);
+        job.results.max = r.mid;
+        lines.push("MAX: опубликовано (" + r.mid + ")");
+        allWarnings.push(...r.warnings);
+      } catch (e) {
+        job.results.max = "ERROR: " + e.message;
+        lines.push("MAX: не вышло — " + e.message);
+      }
+    }
+
+    job.status = Object.values(job.results).some((v) => String(v).startsWith("ERROR"))
+      ? "error"
+      : "done";
+    job.finishedAt = Date.now();
+    saveJobs();
+
+    if (allWarnings.length) lines.push("", "Предупреждения:", ...allWarnings.map((w) => "• " + w));
+    lines.push("", "Канал VK-Мессенджера по API недоступен — его постим руками. Текст для вставки пришлю по команде /text.");
+    await ctx.reply(lines.join("\n"));
+  }
+
+  // ---------- команды ----------
+
+  bot.command("dubl", async (ctx, next) => {
+    if (ctx.chat.type !== "private" || !isOwner(ctx)) return;
+    if (!lastForward) {
+      await ctx.reply("Не вижу пересылки. Перешли пост и сразу напиши /dubl.");
+      return;
+    }
+    const f = lastForward;
+    lastForward = null;
+    await enqueue(ctx, f);
+  });
+
+  bot.command("ochered", async (ctx) => {
+    if (ctx.chat.type !== "private" || !isOwner(ctx)) return;
+    if (!jobs.length) return void (await ctx.reply("Очередь пуста."));
+    const rows = jobs.slice(-10).map((j) => {
+      const when = new Date(j.createdAt).toLocaleString("ru-RU");
+      const res = Object.entries(j.results || {}).map(([k, v]) => `${k}: ${v}`).join("; ");
+      return `${when} — ${j.status} — ${describeJob(j)}${res ? "\n  " + res : ""}`;
+    });
+    await ctx.reply(rows.join("\n"));
+  });
+
+  bot.command("text", async (ctx) => {
+    if (ctx.chat.type !== "private" || !isOwner(ctx)) return;
+    const job = lastDone() || jobs[jobs.length - 1];
+    if (!job) return void (await ctx.reply("Нечего отдавать — заявок ещё не было."));
+    await ctx.reply("Текст последнего дубля — для канала VK-Мессенджера:");
+    for (let i = 0; i < job.text.length; i += 4000) {
+      await ctx.reply(job.text.slice(i, i + 4000), { link_preview_options: { is_disabled: true } });
+    }
+  });
+
+  bot.command("crosspost_status", async (ctx) => {
+    if (ctx.chat.type !== "private" || !isOwner(ctx)) return;
+    const miss = describeConfig(cfg);
+    await ctx.reply(
+      [
+        `VK: ${cfg.vkReady ? "готов, группа " + cfg.vk.groupId : "не настроен"}`,
+        `MAX: ${cfg.maxReady ? "готов, чат " + cfg.max.chatId : "не настроен"}`,
+        `Источник: ${cfg.channel.username ? "@" + cfg.channel.username : cfg.channel.id || "не задан"}`,
+        `Подтверждение: ${auto ? "выключено (CROSSPOST_AUTO=1)" : "плюсом"}`,
+        `В очереди ждут: ${pending().length}`,
+        miss.length ? "Не хватает: " + miss.join("; ") : "",
+      ]
+        .filter(Boolean)
+        .join("\n")
+    );
+  });
+
+  // Проверка боем, но без публикации: живы ли токены с того IP, где крутится бот.
+  bot.command("crosspost_check", async (ctx) => {
+    if (ctx.chat.type !== "private" || !isOwner(ctx)) return;
+    await ctx.reply("Проверяю площадки…");
+    try {
+      const r = await checkPlatforms(cfg);
+      const rows = Object.entries(r).map(([k, v]) => `${k.toUpperCase()}: ${v}`);
+      await ctx.reply(rows.length ? rows.join("\n") : "Проверять нечего — площадки не настроены.");
+    } catch (e) {
+      await ctx.reply("Проверка сорвалась: " + e.message);
+    }
+  });
+
+  // ---------- основной перехват сообщений ----------
+
+  bot.on("message", async (ctx, next) => {
+    if (ctx.chat.type !== "private" || !isOwner(ctx)) return next();
+    const msg = ctx.message;
+    const text = msg.text || msg.caption || "";
+
+    const chat = originOf(msg);
+    if (chat || msg.forward_origin) {
+      const media = mediaFromMessage(msg);
+      const srcId = msg.forward_origin?.message_id || msg.forward_from_message_id || null;
+      // пересылку из любого места запоминаем — вдруг попросят /dubl
+      lastForward = { text, media, srcId };
+
+      if (!isSourceChannel(chat, cfg)) return next(); // чужая пересылка — пусть Клод отвечает как обычно
+
+      if (msg.media_group_id) bufferGroup(ctx, msg, text, media);
+      else await enqueue(ctx, { text, media, srcId });
+      return;
+    }
+
+    // подтверждение/отмена — только пока есть свежая заявка, иначе это обычный разговор
+    const word = text.trim().toLowerCase();
+    const waiting = pending().filter((j) => Date.now() - j.createdAt < CONFIRM_WINDOW_MS);
+    if (waiting.length && (CONFIRM.has(word) || CANCEL.has(word))) {
+      if (CONFIRM.has(word)) {
+        for (const j of waiting) j.status = "approved";
+        saveJobs();
+        await ctx.reply(`Ок, публикую (${waiting.length} шт.).`);
+        void runPending(ctx);
+      } else {
+        for (const j of waiting) j.status = "cancelled";
+        saveJobs();
+        await ctx.reply("Отменил, никуда не отправляю.");
+      }
+      return;
+    }
+
+    return next();
+  });
+}

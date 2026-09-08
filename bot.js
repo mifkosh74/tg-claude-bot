@@ -1,5 +1,6 @@
 import { Bot } from "grammy";
 import { query } from "@anthropic-ai/claude-agent-sdk";
+import { registerCrosspost } from "./crosspost-inbox.js";
 import { readFileSync, writeFileSync, existsSync } from "fs";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
@@ -135,6 +136,11 @@ bot.command("reset", async (ctx) => {
   saveState();
   await ctx.reply("Контекст этого чата очищен.");
 });
+
+// Дубль постов в VK и MAX по пересылке в личку.
+// Регистрируется ДО обработчика текста: пересылки и «+»/«-» перехватываются
+// здесь, всё остальное уходит дальше к Клоду.
+registerCrosspost(bot, { botToken: BOT_TOKEN, isOwner, dir: __dirname });
 
 bot.on("message:text", async (ctx) => {
   const chatId = ctx.chat.id;

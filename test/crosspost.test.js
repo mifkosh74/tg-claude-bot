@@ -76,10 +76,15 @@ const fakeBot = {
   on: (filter, fn) => filter === "message" && messageHandlers.push(fn),
 };
 
+const rewrites = [];
 registerCrosspost(fakeBot, {
   botToken: "tg-test-token",
   isOwner: (ctx) => ctx.from?.id === OWNER,
   dir: mkdtempSync(join(tmpdir(), "cp-")),
+  onRewrite: async (ctx, text) => {
+    rewrites.push(text);
+    await ctx.reply("переписал: " + text.slice(0, 20));
+  },
 });
 
 let nextCalls = 0;
@@ -143,6 +148,20 @@ test("чужая пересылка и обычный текст уходят к
   await feed(chat);
   assert.equal(nextCalls, 2);
   assert.equal(alien.replies.length + chat.replies.length, 0);
+});
+
+test("длинная пересылка из чужого канала уходит в рерайт, а не в дубль", async () => {
+  nextCalls = 0;
+  const long = "Ц".repeat(300);
+  const ctx = ctxFor({
+    message_id: 20,
+    text: long,
+    forward_origin: { type: "channel", chat: { id: -100777, username: "someoneelse" }, message_id: 7 },
+  });
+  await feed(ctx);
+  assert.equal(nextCalls, 0, "рерайт не должен доходить до обычного разговора");
+  assert.equal(rewrites.at(-1), long);
+  assert.match(ctx.replies.join("\n"), /переписал/);
 });
 
 test("«ок» без ждущей заявки — это разговор, а не публикация", async () => {

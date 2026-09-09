@@ -30,7 +30,11 @@ const GROUP_WINDOW_MS = 2500; // сколько ждём остальные со
 const CONFIRM_WINDOW_MS = 30 * 60 * 1000; // «ок» старше получаса — это уже разговор с Клодом, а не подтверждение
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 
-export function registerCrosspost(bot, { botToken, isOwner, dir }) {
+// Пересылка короче этого просто уходит Клоду в разговор: рерайтить реплику
+// из чата смысла нет, а вот пост из чужого канала — почти всегда да.
+const REWRITE_MIN_LENGTH = 150;
+
+export function registerCrosspost(bot, { botToken, isOwner, dir, onRewrite }) {
   const cfg = loadCrosspostConfig();
   const QUEUE_FILE = join(dir, "crosspost_queue.json");
 
@@ -63,6 +67,7 @@ export function registerCrosspost(bot, { botToken, isOwner, dir }) {
 
   const groupBuffers = new Map(); // media_group_id -> { items, text, timer, srcId }
   let lastForward = null; // последняя пересылка ЛЮБОГО происхождения — для команды /dubl
+  let lastRewriteSource = null; // текст последней чужой пересылки — для команды /esche
   let publishing = false;
 
   // ---------- разбор сообщения ----------
@@ -244,6 +249,15 @@ export function registerCrosspost(bot, { botToken, isOwner, dir }) {
     await enqueue(ctx, f);
   });
 
+  bot.command("esche", async (ctx) => {
+    if (ctx.chat.type !== "private" || !isOwner(ctx)) return;
+    if (!lastRewriteSource) {
+      await ctx.reply("Нечего переписывать. Перешли пост из чужого канала — сделаю рерайт.");
+      return;
+    }
+    await onRewrite(ctx, lastRewriteSource);
+  });
+
   bot.command("ochered", async (ctx) => {
     if (ctx.chat.type !== "private" || !isOwner(ctx)) return;
     if (!jobs.length) return void (await ctx.reply("Очередь пуста."));
@@ -309,7 +323,17 @@ export function registerCrosspost(bot, { botToken, isOwner, dir }) {
       // пересылку из любого места запоминаем — вдруг попросят /dubl
       lastForward = { text, media, srcId };
 
-      if (!isSourceChannel(chat, cfg)) return next(); // чужая пересылка — пусть Клод отвечает как обычно
+      // Чужая пересылка — это заявка на рерайт, а не на дубль.
+      // Короткие обрывки отдаём Клоду в обычный разговор.
+      if (!isSourceChannel(chat, cfg)) {
+        if (onRewrite && text.trim().length >= REWRITE_MIN_LENGTH) {
+          if (msg.media_group_id && !text.trim()) return; // остальные картинки альбома молча пропускаем
+          lastRewriteSource = text;
+          await onRewrite(ctx, text);
+          return;
+        }
+        return next();
+      }
 
       if (msg.media_group_id) bufferGroup(ctx, msg, text, media);
       else await enqueue(ctx, { text, media, srcId });

@@ -48,6 +48,10 @@ const server = http.createServer(async (req, res) => {
       return json({ photos: { p1: { token: "phototok" } } });
     case "/max/messages":
       return json({ message: { body: { mid: "mid.test123" } } });
+    case "/tg/bottg-channel-token/sendMessage":
+      return json({ ok: true, result: { message_id: 4242 } });
+    case "/tg/bottg-channel-token/sendMediaGroup":
+      return json({ ok: true, result: [{ message_id: 4242 }] });
     default:
       res.statusCode = 404;
       return json({ error: "no route " + url.pathname });
@@ -64,6 +68,8 @@ process.env.VK_USER_TOKEN = "vk-test-token";
 process.env.MAX_BOT_TOKEN = "max-test-token";
 process.env.MAX_CHAT_ID = "-71962541614558";
 process.env.CROSSPOST_CHANNEL = "@" + CHANNEL;
+process.env.TG_API_BASE = `${base}/tg`;
+process.env.TG_CHANNEL_BOT_TOKEN = "tg-channel-token";
 
 const { registerCrosspost } = await import("../crosspost-inbox.js");
 const { postVk, collectMedia } = await import("../crosspost.js");
@@ -81,9 +87,9 @@ registerCrosspost(fakeBot, {
   botToken: "tg-test-token",
   isOwner: (ctx) => ctx.from?.id === OWNER,
   dir: mkdtempSync(join(tmpdir(), "cp-")),
-  onRewrite: async (ctx, text) => {
+  onRewrite: async (text) => {
     rewrites.push(text);
-    await ctx.reply("переписал: " + text.slice(0, 20));
+    return "ПЕРЕПИСАННЫЙ ВАРИАНТ поста";
   },
 });
 
@@ -161,7 +167,16 @@ test("длинная пересылка из чужого канала уход�
   await feed(ctx);
   assert.equal(nextCalls, 0, "рерайт не должен доходить до обычного разговора");
   assert.equal(rewrites.at(-1), long);
-  assert.match(ctx.replies.join("\n"), /переписал/);
+  assert.match(ctx.replies.join("\n"), /ПЕРЕПИСАННЫЙ ВАРИАНТ/);
+  // и рерайт, в отличие от дубля, идёт в том числе в сам Telegram-канал
+  assert.match(ctx.replies.join("\n"), /Telegram, VK, MAX/);
+});
+
+test("плюс после рерайта публикует и в Telegram-канал", async () => {
+  const ctx = ctxFor({ message_id: 21, text: "+" });
+  await feed(ctx);
+  assert.ok(await waitFor(ctx, "Telegram: https://t.me/neurokean_ch/4242"), ctx.replies.join(" | "));
+  assert.ok(await waitFor(ctx, "VK: https://vk.com/wall-228959585_999"), ctx.replies.join(" | "));
 });
 
 test("«ок» без ждущей заявки — это разговор, а не публикация", async () => {

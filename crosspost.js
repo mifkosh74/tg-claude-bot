@@ -20,6 +20,7 @@
 const VK_API = process.env.VK_API_BASE || "https://api.vk.com/method";
 const VK_V = "5.199";
 const MAX_API = process.env.MAX_API_BASE || "https://botapi.max.ru";
+const TG_API = process.env.TG_API_BASE || "https://api.telegram.org";
 const MAX_TEXT_LIMIT = 4000;
 const TG_FILE_LIMIT = 20 * 1024 * 1024; // Bot API не отдаёт файлы тяжелее 20 МБ
 
@@ -37,10 +38,17 @@ export function loadCrosspostConfig(env = process.env) {
       username: String(env.CROSSPOST_CHANNEL || "").replace(/^@/, "").toLowerCase(),
       id: env.CROSSPOST_CHANNEL_ID ? String(env.CROSSPOST_CHANNEL_ID) : "",
     },
+    // Публикация в сам Telegram-канал (нужна только рерайтам: дубль там уже есть).
+    // Постим не своим токеном, а токеном дайджест-бота — он уже админ канала.
+    tg: {
+      token: env.TG_CHANNEL_BOT_TOKEN || "",
+      channel: env.CROSSPOST_CHANNEL || "",
+    },
     videoWaitMs: Number(env.MAX_VIDEO_WAIT_MS || 20000),
   };
   cfg.vkReady = Boolean(cfg.vk.groupId && cfg.vk.userToken);
   cfg.maxReady = Boolean(cfg.max.token && cfg.max.chatId);
+  cfg.tgReady = Boolean(cfg.tg.token && cfg.tg.channel);
   cfg.ready = cfg.vkReady || cfg.maxReady;
   return cfg;
 }
@@ -49,6 +57,7 @@ export function describeConfig(cfg) {
   const miss = [];
   if (!cfg.vkReady) miss.push("VK (нужны VK_GROUP_ID + VK_USER_TOKEN)");
   if (!cfg.maxReady) miss.push("MAX (нужны MAX_BOT_TOKEN + MAX_CHAT_ID)");
+  if (!cfg.tgReady) miss.push("Telegram-канал для рерайтов (нужен TG_CHANNEL_BOT_TOKEN)");
   if (!cfg.channel.username && !cfg.channel.id) miss.push("канал-источник (CROSSPOST_CHANNEL)");
   return miss;
 }
@@ -83,7 +92,7 @@ async function fetchJson(url, init, label) {
 
 export async function tgDownload(botToken, fileId) {
   const info = await fetchJson(
-    `https://api.telegram.org/bot${botToken}/getFile?file_id=${encodeURIComponent(fileId)}`,
+    `${TG_API}/bot${botToken}/getFile?file_id=${encodeURIComponent(fileId)}`,
     undefined,
     "TG getFile"
   );
@@ -92,7 +101,7 @@ export async function tgDownload(botToken, fileId) {
     throw new Error(/too big/i.test(d) ? "файл тяжелее 20 МБ, Bot API его не отдаёт" : d);
   }
   const path = info.result.file_path;
-  const r = await fetch(`https://api.telegram.org/file/bot${botToken}/${path}`);
+  const r = await fetch(`${TG_API}/file/bot${botToken}/${path}`);
   if (!r.ok) throw new Error(`скачивание файла: HTTP ${r.status}`);
   return { buffer: Buffer.from(await r.arrayBuffer()), path };
 }
@@ -102,7 +111,17 @@ export async function tgDownload(botToken, fileId) {
 async function vkCall(method, params) {
   const body = new URLSearchParams({ ...params, v: VK_V });
   const j = await fetchJson(`${VK_API}/${method}`, { method: "POST", body }, `VK ${method}`);
-  if (j.error) throw new Error(`VK ${method}: ${j.error.error_msg}`);
+  if (j.error) {
+    // 9 — Flood control: ВК придушил токен за частые запросы. Само отпускает,
+    // но сообщение стоит написать человеческое, иначе выглядит как поломка.
+    if (j.error.error_code === 9) {
+      throw new Error(
+        "ВК временно придушил токен за частые запросы (Flood control). " +
+          "Обычно отпускает за час — просто повтори позже."
+      );
+    }
+    throw new Error(`VK ${method}: ${j.error.error_msg}`);
+  }
   return j.response;
 }
 
@@ -248,6 +267,64 @@ export async function postMax(cfg, text, media) {
   return { mid, warnings };
 }
 
+// ---------- Telegram-канал (только для рерайтов) ----------
+
+const TG_CAPTION_LIMIT = 1024;
+const TG_TEXT_LIMIT = 4096;
+
+async function tgCall(cfg, method, payload, isForm = false) {
+  const url = `${TG_API}/bot${cfg.tg.token}/${method}`;
+  const init = isForm
+    ? { method: "POST", body: payload }
+    : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) };
+  const j = await fetchJson(url, init, `TG ${method}`);
+  if (!j.ok) throw new Error(`TG ${method}: ${j.description || JSON.stringify(j).slice(0, 200)}`);
+  return j.result;
+}
+
+export async function postTelegramChannel(cfg, text, media) {
+  const chat = cfg.tg.channel;
+  const photos = media.filter((m) => m.kind === "photo");
+  const warnings = [];
+  const ids = [];
+
+  if (media.length > photos.length) {
+    warnings.push("Telegram: видео в рерайт не кладу, только фото и текст");
+  }
+
+  // Короткий текст с картинками — одним сообщением, подписью под фото.
+  const asCaption = photos.length && text.length <= TG_CAPTION_LIMIT;
+
+  if (photos.length) {
+    const fd = new FormData();
+    fd.append("chat_id", chat);
+    const groupMedia = photos.map((p, i) => ({
+      type: "photo",
+      media: `attach://p${i}`,
+      ...(asCaption && i === 0 ? { caption: text } : {}),
+    }));
+    fd.append("media", JSON.stringify(groupMedia));
+    photos.forEach((p, i) => fd.append(`p${i}`, new Blob([p.buffer]), p.filename));
+    const sent = await tgCall(cfg, "sendMediaGroup", fd, true);
+    ids.push(...sent.map((m) => m.message_id));
+  }
+
+  if (!asCaption) {
+    if (text.length > TG_TEXT_LIMIT) {
+      warnings.push(`Telegram: текст ${text.length} симв., обрезал до ${TG_TEXT_LIMIT}`);
+    }
+    const sent = await tgCall(cfg, "sendMessage", {
+      chat_id: chat,
+      text: text.slice(0, TG_TEXT_LIMIT),
+      link_preview_options: { is_disabled: true },
+    });
+    ids.push(sent.message_id);
+  }
+
+  const uname = String(chat).replace(/^@/, "");
+  return { url: `https://t.me/${uname}/${ids[0]}`, ids, warnings };
+}
+
 // ---------- Проверка площадок без публикации ----------
 
 // Только чтение: подтверждает, что токены живы и что площадки пускают нас
@@ -279,6 +356,19 @@ export async function checkPlatforms(cfg) {
       out.max = `ок — бот ${me.name || me.username || me.user_id}`;
     } catch (e) {
       out.max = "не отвечает: " + e.message;
+    }
+  }
+  if (cfg.tgReady) {
+    try {
+      const chat = await tgCall(cfg, "getChat", { chat_id: cfg.tg.channel });
+      const me = await tgCall(cfg, "getMe", {});
+      const admins = await tgCall(cfg, "getChatAdministrators", { chat_id: cfg.tg.channel });
+      const mine = admins.find((a) => a.user.id === me.id);
+      out["telegram-канал"] = mine?.can_post_messages
+        ? `ок — «${chat.title}», публиковать можно`
+        : `бот @${me.username} в канале «${chat.title}» без права публикации`;
+    } catch (e) {
+      out["telegram-канал"] = "не отвечает: " + e.message;
     }
   }
   return out;

@@ -20,6 +20,7 @@ import {
   collectMedia,
   postVk,
   postMax,
+  postTelegramChannel,
   checkPlatforms,
 } from "./crosspost.js";
 
@@ -68,6 +69,8 @@ export function registerCrosspost(bot, { botToken, isOwner, dir, onRewrite }) {
   const groupBuffers = new Map(); // media_group_id -> { items, text, timer, srcId }
   let lastForward = null; // последняя пересылка ЛЮБОГО происхождения — для команды /dubl
   let lastRewriteSource = null; // текст последней чужой пересылки — для команды /esche
+  let lastRewriteMedia = [];
+  let rewriting = false;
   let publishing = false;
 
   // ---------- разбор сообщения ----------
@@ -117,12 +120,24 @@ export function registerCrosspost(bot, { botToken, isOwner, dir, onRewrite }) {
     return parts.join(", ");
   }
 
-  async function enqueue(ctx, { text, media, srcId }) {
+  // Дубль — пост уже вышел в Telegram-канале, туда его повторять не надо.
+  // Рерайт — текст новый, он идёт на все площадки, включая сам канал.
+  function platformsOf(kind) {
+    const list = [];
+    if (kind === "rewrite" && cfg.tgReady) list.push("telegram");
+    if (cfg.vkReady) list.push("vk");
+    if (cfg.maxReady) list.push("max");
+    return list;
+  }
+
+  const PLATFORM_NAMES = { telegram: "Telegram", vk: "VK", max: "MAX" };
+
+  async function enqueue(ctx, { text, media, srcId, kind = "dub" }) {
     if (!text.trim() && !media.length) {
       await ctx.reply("В пересылке нет ни текста, ни вложений — дублировать нечего.");
       return;
     }
-    if (jobs.some((j) => j.srcId && j.srcId === srcId && j.status !== "cancelled")) {
+    if (srcId && jobs.some((j) => j.srcId === srcId && j.status !== "cancelled")) {
       await ctx.reply(`Пост ${srcId} у меня уже был. Пересылай заново только если предыдущая заявка отменена.`);
       return;
     }
@@ -131,6 +146,7 @@ export function registerCrosspost(bot, { botToken, isOwner, dir, onRewrite }) {
       createdAt: Date.now(),
       chatId: ctx.chat.id,
       srcId,
+      kind,
       text,
       media,
       status: "pending",
@@ -139,7 +155,7 @@ export function registerCrosspost(bot, { botToken, isOwner, dir, onRewrite }) {
     jobs.push(job);
     saveJobs();
 
-    const platforms = [cfg.vkReady && "VK", cfg.maxReady && "MAX"].filter(Boolean).join(" и ");
+    const platforms = platformsOf(kind).map((p) => PLATFORM_NAMES[p]).join(", ");
     if (!platforms) {
       job.status = "cancelled";
       saveJobs();
@@ -151,6 +167,12 @@ export function registerCrosspost(bot, { botToken, isOwner, dir, onRewrite }) {
       job.status = "approved";
       saveJobs();
       void runPending(ctx);
+      return;
+    }
+    if (kind === "rewrite") {
+      await ctx.reply(
+        `Публикую в ${platforms} по плюсу (+). Минус (-) — выкинуть, /esche — другой вариант.`
+      );
       return;
     }
     await ctx.reply(
@@ -177,6 +199,41 @@ export function registerCrosspost(bot, { botToken, isOwner, dir, onRewrite }) {
     groupBuffers.set(key, buf);
   }
 
+  // ---------- рерайт чужого поста ----------
+
+  async function doRewrite(ctx, sourceText, media = []) {
+    if (!onRewrite) return;
+    if (rewriting) {
+      await ctx.reply("Секунду, ещё переписываю прошлый 🙃");
+      return;
+    }
+    rewriting = true;
+    const typing = setInterval(() => ctx.replyWithChatAction?.("typing").catch(() => {}), 5000);
+    try {
+      await ctx.reply("Переписываю…");
+      const out = (await onRewrite(sourceText)) || "";
+      if (!out.trim()) throw new Error("вернулся пустой текст");
+
+      lastRewriteSource = sourceText;
+      lastRewriteMedia = media;
+      // Прошлый неподтверждённый рерайт снимаем, иначе «+» опубликует оба.
+      for (const j of jobs) {
+        if (j.kind === "rewrite" && j.status === "pending") j.status = "cancelled";
+      }
+
+      for (let i = 0; i < out.length; i += 4000) {
+        await ctx.reply(out.slice(i, i + 4000), { link_preview_options: { is_disabled: true } });
+      }
+      await enqueue(ctx, { text: out, media, srcId: null, kind: "rewrite" });
+    } catch (e) {
+      console.error("Ошибка рерайта:", e);
+      await ctx.reply("Рерайт не получился: " + e.message);
+    } finally {
+      clearInterval(typing);
+      rewriting = false;
+    }
+  }
+
   // ---------- публикация ----------
 
   async function runPending(ctx) {
@@ -200,8 +257,22 @@ export function registerCrosspost(bot, { botToken, isOwner, dir, onRewrite }) {
     const { media, warnings } = await collectMedia(botToken, job.media);
     const lines = [];
     const allWarnings = [...warnings];
+    const plats = platformsOf(job.kind || "dub");
 
-    if (cfg.vkReady) {
+    // Telegram первым: канал — первоисточник, остальные площадки его повторяют.
+    if (plats.includes("telegram")) {
+      try {
+        const r = await postTelegramChannel(cfg, job.text, media);
+        job.results.telegram = r.url;
+        lines.push("Telegram: " + r.url);
+        allWarnings.push(...r.warnings);
+      } catch (e) {
+        job.results.telegram = "ERROR: " + e.message;
+        lines.push("Telegram: не вышло — " + e.message);
+      }
+    }
+
+    if (plats.includes("vk")) {
       try {
         const r = await postVk(cfg, job.text, media);
         job.results.vk = r.url;
@@ -213,7 +284,7 @@ export function registerCrosspost(bot, { botToken, isOwner, dir, onRewrite }) {
         lines.push("VK: не вышло — " + e.message);
       }
     }
-    if (cfg.maxReady) {
+    if (plats.includes("max")) {
       try {
         const r = await postMax(cfg, job.text, media);
         job.results.max = r.mid;
@@ -255,7 +326,7 @@ export function registerCrosspost(bot, { botToken, isOwner, dir, onRewrite }) {
       await ctx.reply("Нечего переписывать. Перешли пост из чужого канала — сделаю рерайт.");
       return;
     }
-    await onRewrite(ctx, lastRewriteSource);
+    await doRewrite(ctx, lastRewriteSource, lastRewriteMedia);
   });
 
   bot.command("ochered", async (ctx) => {
@@ -327,11 +398,10 @@ export function registerCrosspost(bot, { botToken, isOwner, dir, onRewrite }) {
       // Короткие обрывки отдаём Клоду в обычный разговор.
       if (!isSourceChannel(chat, cfg)) {
         if (onRewrite && text.trim().length >= REWRITE_MIN_LENGTH) {
-          if (msg.media_group_id && !text.trim()) return; // остальные картинки альбома молча пропускаем
-          lastRewriteSource = text;
-          await onRewrite(ctx, text);
+          await doRewrite(ctx, text, media);
           return;
         }
+        if (msg.media_group_id) return; // молчим на остальных картинках чужого альбома
         return next();
       }
 

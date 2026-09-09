@@ -129,31 +129,6 @@ async function rewritePost(sourceText) {
   return text;
 }
 
-async function handleRewrite(ctx, sourceText) {
-  const chatId = ctx.chat.id;
-  if (busy.has(chatId)) {
-    await ctx.reply("Секунду, ещё думаю над прошлым сообщением 🙃");
-    return;
-  }
-  busy.add(chatId);
-  const typing = setInterval(() => ctx.replyWithChatAction("typing").catch(() => {}), 5000);
-  ctx.replyWithChatAction("typing").catch(() => {});
-  try {
-    const out = await rewritePost(sourceText);
-    if (!out) throw new Error("пустой ответ");
-    for (let i = 0; i < out.length; i += 4000) {
-      await ctx.reply(out.slice(i, i + 4000), { link_preview_options: { is_disabled: true } });
-    }
-    await ctx.reply("Не то — команда /esche, напишу другой вариант.");
-  } catch (e) {
-    console.error("Ошибка рерайта:", e);
-    await ctx.reply("Рерайт не получился 😔 Попробуй переслать ещё раз.");
-  } finally {
-    clearInterval(typing);
-    busy.delete(chatId);
-  }
-}
-
 // --- Telegram ---
 const bot = new Bot(BOT_TOKEN);
 let me;
@@ -204,7 +179,7 @@ bot.command("reset", async (ctx) => {
 // Дубль постов в VK и MAX по пересылке в личку.
 // Регистрируется ДО обработчика текста: пересылки и «+»/«-» перехватываются
 // здесь, всё остальное уходит дальше к Клоду.
-registerCrosspost(bot, { botToken: BOT_TOKEN, isOwner, dir: __dirname, onRewrite: handleRewrite });
+registerCrosspost(bot, { botToken: BOT_TOKEN, isOwner, dir: __dirname, onRewrite: rewritePost });
 
 bot.on("message:text", async (ctx) => {
   const chatId = ctx.chat.id;

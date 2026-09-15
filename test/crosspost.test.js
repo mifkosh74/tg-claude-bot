@@ -228,4 +228,38 @@ test("вложение тяжелее 20 МБ пропускается без п
   assert.match(warnings[0], /45\.0 МБ/);
 });
 
+test("чужой альбом: рерайт получает и текст, и все фото", async () => {
+  nextCalls = 0;
+  const long = "Ч".repeat(200);
+  const photo = (n) => [{ file_id: `s${n}`, file_size: 1000 }, { file_id: `b${n}`, file_size: 90000 }];
+  const origin = { type: "channel", chat: { id: -100888, username: "alienalbum" }, message_id: 900 };
+  const a = ctxFor({ message_id: 30, media_group_id: "88", caption: long, photo: photo(1), forward_origin: origin });
+  const b = ctxFor({ message_id: 31, media_group_id: "88", photo: photo(2), forward_origin: { ...origin, message_id: 901 } });
+  await feed(a);
+  await feed(b);
+  assert.equal(nextCalls, 0, "картинки чужого альбома не должны уходить в разговор");
+  // ответ уходит по последнему сообщению альбома
+  assert.ok(await waitFor(b, "2 фото"), b.replies.join(" | "));
+  assert.equal(rewrites.at(-1), long);
+  const cancel = ctxFor({ message_id: 32, text: "-" });
+  await feed(cancel);
+});
+
+test("рерайт без картинки: фото отдельным сообщением прикрепляется к заявке", async () => {
+  const long = "Ш".repeat(200);
+  const ctx = ctxFor({
+    message_id: 40,
+    text: long,
+    forward_origin: { type: "channel", chat: { id: -100999, username: "nopic" }, message_id: 5 },
+  });
+  await feed(ctx);
+  assert.match(ctx.replies.join("\n"), /Картинки в пересылке не было/);
+  const pic = ctxFor({ message_id: 41, photo: [{ file_id: "s", file_size: 100 }, { file_id: "b", file_size: 5000 }] });
+  await feed(pic);
+  // текст заявки — уже переписанный, а не исходный
+  assert.match(pic.replies.join("\n"), /Прикрепил \(текст \d+ симв\., 1 фото\)/);
+  const cancel = ctxFor({ message_id: 42, text: "-" });
+  await feed(cancel);
+});
+
 test.after(() => server.close());

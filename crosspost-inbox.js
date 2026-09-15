@@ -170,8 +170,11 @@ export function registerCrosspost(bot, { botToken, isOwner, dir, onRewrite }) {
       return;
     }
     if (kind === "rewrite") {
+      const attach = media.length
+        ? `Вложения: ${describeJob(job).replace(/^текст \d+ симв\.,? ?/, "")}.`
+        : "Картинки в пересылке не было (если она была превью ссылки — Telegram её боту не отдаёт). Пришли фото отдельным сообщением — прикреплю.";
       await ctx.reply(
-        `Публикую в ${platforms} по плюсу (+). Минус (-) — выкинуть, /esche — другой вариант.`
+        `${attach}\nПубликую в ${platforms} по плюсу (+). Минус (-) — выкинуть, /esche — другой вариант.`
       );
       return;
     }
@@ -183,7 +186,8 @@ export function registerCrosspost(bot, { botToken, isOwner, dir, onRewrite }) {
 
   // Пересылка альбома приходит несколькими сообщениями с общим media_group_id —
   // копим их пару секунд и собираем в одну заявку.
-  function bufferGroup(ctx, msg, text, media) {
+  // foreign=true — альбом из чужого канала: когда соберётся, уходит в рерайт, а не в дубль.
+  function bufferGroup(ctx, msg, text, media, foreign = false) {
     const key = msg.media_group_id;
     const buf = groupBuffers.get(key) || { items: [], text: "", srcId: null };
     buf.items.push(...media);
@@ -192,11 +196,31 @@ export function registerCrosspost(bot, { botToken, isOwner, dir, onRewrite }) {
     clearTimeout(buf.timer);
     buf.timer = setTimeout(() => {
       groupBuffers.delete(key);
+      if (foreign) {
+        if (onRewrite && buf.text.trim().length >= REWRITE_MIN_LENGTH) {
+          doRewrite(ctx, buf.text, buf.items).catch((e) => console.error("Ошибка рерайта альбома:", e));
+        }
+        return;
+      }
       enqueue(ctx, { text: buf.text, media: buf.items, srcId: buf.srcId }).catch((e) =>
         console.error("Ошибка постановки альбома в очередь:", e)
       );
     }, GROUP_WINDOW_MS);
     groupBuffers.set(key, buf);
+  }
+
+  // Картинка, присланная отдельно (не пересылкой), пока ждёт подтверждения рерайт —
+  // это вложение к нему: превью ссылок Bot API не отдаёт, приходится докидывать руками.
+  async function attachToPendingRewrite(ctx, msg) {
+    const job = pending().find((j) => j.kind === "rewrite");
+    if (!job) return false;
+    const media = mediaFromMessage(msg);
+    if (!media.length) return false;
+    job.media.push(...media);
+    lastRewriteMedia = job.media;
+    saveJobs();
+    await ctx.reply(`Прикрепил (${describeJob(job)}). Плюс (+) — публикую.`);
+    return true;
   }
 
   // ---------- рерайт чужого поста ----------
@@ -397,11 +421,16 @@ export function registerCrosspost(bot, { botToken, isOwner, dir, onRewrite }) {
       // Чужая пересылка — это заявка на рерайт, а не на дубль.
       // Короткие обрывки отдаём Клоду в обычный разговор.
       if (!isSourceChannel(chat, cfg)) {
+        if (msg.media_group_id) {
+          // Чужой альбом: текст и фото приходят разными сообщениями — копим всё,
+          // рерайт запустится, когда соберётся.
+          if (onRewrite) bufferGroup(ctx, msg, text, media, true);
+          return;
+        }
         if (onRewrite && text.trim().length >= REWRITE_MIN_LENGTH) {
           await doRewrite(ctx, text, media);
           return;
         }
-        if (msg.media_group_id) return; // молчим на остальных картинках чужого альбома
         return next();
       }
 
@@ -409,6 +438,9 @@ export function registerCrosspost(bot, { botToken, isOwner, dir, onRewrite }) {
       else await enqueue(ctx, { text, media, srcId });
       return;
     }
+
+    // фото/видео без пересылки при ожидающем рерайте — докинуть к нему
+    if (!text.trim() && (await attachToPendingRewrite(ctx, msg))) return;
 
     // подтверждение/отмена — только пока есть свежая заявка, иначе это обычный разговор
     const word = text.trim().toLowerCase();

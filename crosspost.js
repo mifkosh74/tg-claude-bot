@@ -284,27 +284,29 @@ async function tgCall(cfg, method, payload, isForm = false) {
 
 export async function postTelegramChannel(cfg, text, media) {
   const chat = cfg.tg.channel;
-  const photos = media.filter((m) => m.kind === "photo");
+  // Фото и видео идут одной медиагруппой (Telegram разрешает их смешивать);
+  // остальное (документы) в канал не кладём.
+  const items = media.filter((m) => m.kind === "photo" || m.kind === "video");
   const warnings = [];
   const ids = [];
 
-  if (media.length > photos.length) {
-    warnings.push("Telegram: видео в рерайт не кладу, только фото и текст");
+  if (media.length > items.length) {
+    warnings.push("Telegram: в рерайт кладу только фото и видео");
   }
 
-  // Короткий текст с картинками — одним сообщением, подписью под фото.
-  const asCaption = photos.length && text.length <= TG_CAPTION_LIMIT;
+  // Короткий текст с вложениями — одним сообщением, подписью под ними.
+  const asCaption = items.length && text.length <= TG_CAPTION_LIMIT;
 
-  if (photos.length) {
+  if (items.length) {
     const fd = new FormData();
     fd.append("chat_id", chat);
-    const groupMedia = photos.map((p, i) => ({
-      type: "photo",
-      media: `attach://p${i}`,
+    const groupMedia = items.map((m, i) => ({
+      type: m.kind,
+      media: `attach://m${i}`,
       ...(asCaption && i === 0 ? { caption: text } : {}),
     }));
     fd.append("media", JSON.stringify(groupMedia));
-    photos.forEach((p, i) => fd.append(`p${i}`, new Blob([p.buffer]), p.filename));
+    items.forEach((m, i) => fd.append(`m${i}`, new Blob([m.buffer]), m.filename));
     const sent = await tgCall(cfg, "sendMediaGroup", fd, true);
     ids.push(...sent.map((m) => m.message_id));
   }

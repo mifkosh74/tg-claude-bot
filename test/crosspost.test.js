@@ -51,7 +51,8 @@ const server = http.createServer(async (req, res) => {
     case "/tg/bottg-channel-token/sendMessage":
       return json({ ok: true, result: { message_id: 4242 } });
     case "/tg/bottg-channel-token/sendMediaGroup":
-      return json({ ok: true, result: [{ message_id: 4242 }] });
+      lastTgMediaGroup = body; // тело уже прочитано выше
+      return json({ ok: true, result: [{ message_id: 4242 }, { message_id: 4243 }] });
     default:
       res.statusCode = 404;
       return json({ error: "no route " + url.pathname });
@@ -72,7 +73,7 @@ process.env.TG_API_BASE = `${base}/tg`;
 process.env.TG_CHANNEL_BOT_TOKEN = "tg-channel-token";
 
 const { registerCrosspost } = await import("../crosspost-inbox.js");
-const { postVk, collectMedia } = await import("../crosspost.js");
+const { postVk, collectMedia, postTelegramChannel } = await import("../crosspost.js");
 
 // --- заглушка grammy ---
 const commands = {};
@@ -82,6 +83,7 @@ const fakeBot = {
   on: (filter, fn) => filter === "message" && messageHandlers.push(fn),
 };
 
+let lastTgMediaGroup = "";
 const rewrites = [];
 registerCrosspost(fakeBot, {
   botToken: "tg-test-token",
@@ -260,6 +262,18 @@ test("рерайт без картинки: фото отдельным сооб
   assert.match(pic.replies.join("\n"), /Прикрепил \(текст \d+ симв\., 1 фото\)/);
   const cancel = ctxFor({ message_id: 42, text: "-" });
   await feed(cancel);
+});
+
+test("в Telegram-канал рерайт уходит с видео в одной медиагруппе с фото", async () => {
+  const cfg = (await import("../crosspost.js")).loadCrosspostConfig();
+  const r = await postTelegramChannel(cfg, "текст", [
+    { kind: "photo", filename: "p.jpg", buffer: Buffer.from("x") },
+    { kind: "video", filename: "v.mp4", buffer: Buffer.from("y") },
+  ]);
+  assert.equal(r.warnings.length, 0, r.warnings.join(" | "));
+  assert.match(lastTgMediaGroup, /"type":"photo"/);
+  assert.match(lastTgMediaGroup, /"type":"video"/);
+  assert.deepEqual(r.ids, [4242, 4243]);
 });
 
 test.after(() => server.close());

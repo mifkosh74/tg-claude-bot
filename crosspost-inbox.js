@@ -327,7 +327,7 @@ export function registerCrosspost(bot, { botToken, isOwner, dir, onRewrite }) {
     saveJobs();
 
     if (allWarnings.length) lines.push("", "Предупреждения:", ...allWarnings.map((w) => "• " + w));
-    lines.push("", "Канал VK-Мессенджера по API недоступен — его постим руками. Текст для вставки пришлю по команде /text.");
+    lines.push("", "Канал VK-Мессенджера подхватит сторож на компе Николая в течение ~10 минут (если комп включён). Текст для ручной вставки — по команде /text.");
     await ctx.reply(lines.join("\n"));
   }
 

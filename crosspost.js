@@ -137,8 +137,11 @@ async function uploadFile(url, field, item, label) {
 }
 
 async function vkUploadPhoto(cfg, item) {
+  // Сервер загрузки VK регулярно отвечает пустым photo — это флап, а не ошибка
+  // файла: со второй-третьей попытки проходит. Пять попыток с паузой.
   let last;
-  for (let attempt = 1; attempt <= 2; attempt++) {
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    if (attempt > 1) await new Promise((r) => setTimeout(r, 1500 * attempt));
     const srv = await vkCall("photos.getWallUploadServer", {
       access_token: cfg.vk.userToken,
       group_id: cfg.vk.groupId,

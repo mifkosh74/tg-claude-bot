@@ -264,6 +264,27 @@ test("рерайт без картинки: фото отдельным сооб
   await feed(cancel);
 });
 
+test("рерайт с видео тяжелее 20 МБ: сразу предупреждает и просит сжатую замену", async () => {
+  const long = "Э".repeat(200);
+  const ctx = ctxFor({
+    message_id: 50,
+    text: long,
+    video: { file_id: "huge", file_size: 45 * 1048576, file_name: "huge.mp4" },
+    forward_origin: { type: "channel", chat: { id: -100111, username: "bigvideo" }, message_id: 6 },
+  });
+  await feed(ctx);
+  // предупреждение приходит сразу при рерайте, не дожидаясь публикации
+  assert.match(ctx.replies.join("\n"), /45\.0 МБ/);
+  assert.match(ctx.replies.join("\n"), /тяжелее 20 МБ/);
+  assert.match(ctx.replies.join("\n"), /Сожми видео/);
+  // сжатая версия, присланная отдельным сообщением без подписи, приклеивается к заявке
+  const compressed = ctxFor({ message_id: 51, video: { file_id: "small", file_size: 5 * 1048576, file_name: "huge.mp4" } });
+  await feed(compressed);
+  assert.match(compressed.replies.join("\n"), /Прикрепил \(текст \d+ симв\., 1 видео\)/);
+  const cancel = ctxFor({ message_id: 52, text: "-" });
+  await feed(cancel);
+});
+
 test("в Telegram-канал рерайт уходит с видео в одной медиагруппе с фото", async () => {
   const cfg = (await import("../crosspost.js")).loadCrosspostConfig();
   const r = await postTelegramChannel(cfg, "текст", [

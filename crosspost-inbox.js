@@ -22,6 +22,7 @@ import {
   postMax,
   postTelegramChannel,
   checkPlatforms,
+  TG_FILE_LIMIT,
 } from "./crosspost.js";
 
 const CONFIRM = new Set(["+", "да", "ок", "окей", "ok", "go", "поехали", "дубль", "публикуй"]);
@@ -238,8 +239,13 @@ export function registerCrosspost(bot, { botToken, isOwner, dir, onRewrite }) {
       const out = (await onRewrite(sourceText)) || "";
       if (!out.trim()) throw new Error("вернулся пустой текст");
 
+      // Видео тяжелее 20 МБ Bot API всё равно не скачает (упадёт молча при публикации) —
+      // отсеиваем сразу и просим сжатую замену, а не ждём до "+".
+      const oversized = media.filter((m) => m.kind === "video" && m.fileSize > TG_FILE_LIMIT);
+      const usable = media.filter((m) => !oversized.includes(m));
+
       lastRewriteSource = sourceText;
-      lastRewriteMedia = media;
+      lastRewriteMedia = usable;
       // Прошлый неподтверждённый рерайт снимаем, иначе «+» опубликует оба.
       for (const j of jobs) {
         if (j.kind === "rewrite" && j.status === "pending") j.status = "cancelled";
@@ -248,7 +254,16 @@ export function registerCrosspost(bot, { botToken, isOwner, dir, onRewrite }) {
       for (let i = 0; i < out.length; i += 4000) {
         await ctx.reply(out.slice(i, i + 4000), { link_preview_options: { is_disabled: true } });
       }
-      await enqueue(ctx, { text: out, media, srcId: null, kind: "rewrite" });
+      await enqueue(ctx, { text: out, media: usable, srcId: null, kind: "rewrite" });
+      if (oversized.length) {
+        const list = oversized
+          .map((m) => `${m.filename} (${(m.fileSize / 1048576).toFixed(1)} МБ)`)
+          .join(", ");
+        await ctx.reply(
+          `⚠️ ${list} — тяжелее 20 МБ, Bot API такое не скачивает, вложение пропустил.\n` +
+            `Сожми видео и пришли сжатую версию отдельным сообщением без подписи — прикреплю к этой заявке.`
+        );
+      }
     } catch (e) {
       console.error("Ошибка рерайта:", e);
       await ctx.reply("Рерайт не получился: " + e.message);

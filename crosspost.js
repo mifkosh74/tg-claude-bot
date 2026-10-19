@@ -15,10 +15,14 @@
 //  - MAX нужно время на обработку видео перед отправкой сообщения;
 //  - форматирование (bold/italic) никуда не переносится — везде плоский текст.
 
+import { readFileSync, writeFileSync, existsSync } from "fs";
+import { fileURLToPath } from "url";
+
 // Базы API вынесены в переменные окружения только ради офлайн-тестов
 // (test/crosspost.test.js поднимает заглушку) — в бою их задавать не нужно.
 const VK_API = process.env.VK_API_BASE || "https://api.vk.com/method";
 const VK_V = "5.199";
+const VKID_API = process.env.VKID_API_BASE || "https://id.vk.ru";
 const MAX_API = process.env.MAX_API_BASE || "https://botapi.max.ru";
 const TG_API = process.env.TG_API_BASE || "https://api.telegram.org";
 const MAX_TEXT_LIMIT = 4000;
@@ -30,6 +34,16 @@ export function loadCrosspostConfig(env = process.env) {
       groupId: Number(env.VK_GROUP_ID || 0),
       userToken: env.VK_USER_TOKEN || "",
     },
+    // Личный токен через VK ID (с 13.10.2026): у бота своя цепочка входа.
+    // Если она задана, старый постоянный VK_USER_TOKEN не используется.
+    vkid: env.VKID_REFRESH_TOKEN
+      ? {
+          clientId: env.VKID_CLIENT_ID || "54766200",
+          refreshSeed: env.VKID_REFRESH_TOKEN,
+          deviceId: env.VKID_DEVICE_ID || "",
+          stateFile: env.VKID_STATE_FILE || fileURLToPath(new URL("./vkid_state.json", import.meta.url)),
+        }
+      : null,
     max: {
       token: env.MAX_BOT_TOKEN || "",
       chatId: env.MAX_CHAT_ID || "",
@@ -46,7 +60,7 @@ export function loadCrosspostConfig(env = process.env) {
     },
     videoWaitMs: Number(env.MAX_VIDEO_WAIT_MS || 20000),
   };
-  cfg.vkReady = Boolean(cfg.vk.groupId && cfg.vk.userToken);
+  cfg.vkReady = Boolean(cfg.vk.groupId && (cfg.vkid || cfg.vk.userToken));
   cfg.maxReady = Boolean(cfg.max.token && cfg.max.chatId);
   cfg.tgReady = Boolean(cfg.tg.token && cfg.tg.channel);
   cfg.ready = cfg.vkReady || cfg.maxReady;
@@ -55,7 +69,7 @@ export function loadCrosspostConfig(env = process.env) {
 
 export function describeConfig(cfg) {
   const miss = [];
-  if (!cfg.vkReady) miss.push("VK (нужны VK_GROUP_ID + VK_USER_TOKEN)");
+  if (!cfg.vkReady) miss.push("VK (нужны VK_GROUP_ID + VKID_REFRESH_TOKEN и VKID_DEVICE_ID)");
   if (!cfg.maxReady) miss.push("MAX (нужны MAX_BOT_TOKEN + MAX_CHAT_ID)");
   if (!cfg.tgReady) miss.push("Telegram-канал для рерайтов (нужен TG_CHANNEL_BOT_TOKEN)");
   if (!cfg.channel.username && !cfg.channel.id) miss.push("канал-источник (CROSSPOST_CHANNEL)");
@@ -108,6 +122,63 @@ export async function tgDownload(botToken, fileId) {
 
 // ---------- VK ----------
 
+// Личный токен VK ID живёт час, а refresh_token одноразовый: каждое обновление
+// выдаёт новый, старый сгорает. Поэтому у бота СВОЙ вход, отдельный от компа
+// (две стороны с одной цепочкой сбивали бы друг друга), а свежий refresh_token
+// хранится в файле рядом с ботом. Файл переживает перезапуск, но не редеплой
+// из Git — тогда бот честно скажет, что нужен новый вход.
+// Обновление строго одно за раз: два параллельных сожгли бы один ключ дважды.
+let vkidRefreshing = null;
+
+function readVkidState(file) {
+  try {
+    return existsSync(file) ? JSON.parse(readFileSync(file, "utf8")) : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function vkToken(cfg) {
+  const v = cfg.vkid;
+  if (!v) return cfg.vk.userToken; // старый постоянный токен
+  let st = readVkidState(v.stateFile);
+  // свежий вход, вписанный в панель, главнее того, что лежит в файле
+  if (!st || st.seed !== v.refreshSeed) {
+    st = { seed: v.refreshSeed, refresh_token: v.refreshSeed, device_id: v.deviceId };
+  }
+  if (st.access_token && Date.now() < st.expires_at - 5 * 60 * 1000) return st.access_token;
+  if (!vkidRefreshing) {
+    vkidRefreshing = (async () => {
+      const body = new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: st.refresh_token,
+        client_id: v.clientId,
+        device_id: st.device_id,
+        state: "refresh",
+      });
+      const j = await fetchJson(`${VKID_API}/oauth2/auth`, { method: "POST", body }, "VK ID refresh");
+      if (!j.access_token) {
+        throw new Error(
+          `вход VK ID у бота слетел (${j.error_description || j.error || JSON.stringify(j).slice(0, 150)}). ` +
+            "Нужен новый вход: напиши Клоду в Claude Code «перевыпусти VK для бота»."
+        );
+      }
+      const next = {
+        ...st,
+        access_token: j.access_token,
+        refresh_token: j.refresh_token || st.refresh_token,
+        expires_at: Date.now() + (j.expires_in || 3600) * 1000,
+      };
+      writeFileSync(v.stateFile, JSON.stringify(next));
+      return next.access_token;
+    })().finally(() => {
+      vkidRefreshing = null;
+    });
+  }
+  return vkidRefreshing;
+}
+
+
 async function vkCall(method, params) {
   const body = new URLSearchParams({ ...params, v: VK_V });
   const j = await fetchJson(`${VK_API}/${method}`, { method: "POST", body }, `VK ${method}`);
@@ -143,7 +214,7 @@ async function vkUploadPhoto(cfg, item) {
   for (let attempt = 1; attempt <= 5; attempt++) {
     if (attempt > 1) await new Promise((r) => setTimeout(r, 1500 * attempt));
     const srv = await vkCall("photos.getWallUploadServer", {
-      access_token: cfg.vk.userToken,
+      access_token: await vkToken(cfg),
       group_id: cfg.vk.groupId,
     });
     const up = await uploadFile(srv.upload_url, "photo", item, "VK upload");
@@ -152,7 +223,7 @@ async function vkUploadPhoto(cfg, item) {
       continue;
     }
     const saved = await vkCall("photos.saveWallPhoto", {
-      access_token: cfg.vk.userToken,
+      access_token: await vkToken(cfg),
       group_id: cfg.vk.groupId,
       photo: up.photo,
       server: up.server,
@@ -166,7 +237,7 @@ async function vkUploadPhoto(cfg, item) {
 
 async function vkUploadVideo(cfg, item) {
   const sv = await vkCall("video.save", {
-    access_token: cfg.vk.userToken,
+    access_token: await vkToken(cfg),
     group_id: cfg.vk.groupId,
     name: item.filename.replace(/\.[^.]+$/, "") || "video",
     wallpost: 0,
@@ -188,7 +259,7 @@ export async function postVk(cfg, text, media) {
     }
   }
   const res = await vkCall("wall.post", {
-    access_token: cfg.vk.userToken,
+    access_token: await vkToken(cfg),
     owner_id: -cfg.vk.groupId,
     from_group: 1,
     message: text,
@@ -206,7 +277,7 @@ export async function postVk(cfg, text, media) {
 export async function vkAttachPhotoToPost(cfg, postId, text, item) {
   const attachment = await vkUploadPhoto(cfg, item);
   await vkCall("wall.edit", {
-    access_token: cfg.vk.userToken,
+    access_token: await vkToken(cfg),
     owner_id: -cfg.vk.groupId,
     post_id: postId,
     message: text,
@@ -339,9 +410,9 @@ export async function checkPlatforms(cfg) {
   const out = {};
   if (cfg.vkReady) {
     try {
-      const me = await vkCall("users.get", { access_token: cfg.vk.userToken });
+      const me = await vkCall("users.get", { access_token: await vkToken(cfg) });
       const g = await vkCall("groups.getById", {
-        access_token: cfg.vk.userToken,
+        access_token: await vkToken(cfg),
         group_id: cfg.vk.groupId,
       });
       const group = g.groups?.[0] || g[0] || {};

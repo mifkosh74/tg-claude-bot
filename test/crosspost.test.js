@@ -5,7 +5,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -14,6 +14,7 @@ const CHANNEL = "neurokean_ch";
 
 // --- заглушка VK и MAX ---
 const calls = [];
+const usedRefresh = new Set();
 let vkPhotoUploadBehaviour = "ok"; // ok | empty-then-ok | always-empty
 
 const server = http.createServer(async (req, res) => {
@@ -29,6 +30,18 @@ const server = http.createServer(async (req, res) => {
   const base = `http://localhost:${server.address().port}`;
 
   switch (url.pathname) {
+    case "/vkid/oauth2/auth": {
+      // одноразовые refresh: r1 → r2 → r3; повтор сгоревшего — ошибка, как у VK ID
+      const p = new URLSearchParams(body);
+      const chain = { r1: ["a1", "r2"], r2: ["a2", "r3"], r9: ["a9", "r10"] };
+      const hit = chain[p.get("refresh_token")];
+      if (!hit || usedRefresh.has(p.get("refresh_token"))) {
+        res.statusCode = 400;
+        return json({ error: "invalid_grant", error_description: "Refresh token is invalid" });
+      }
+      usedRefresh.add(p.get("refresh_token"));
+      return json({ access_token: hit[0], refresh_token: hit[1], expires_in: 3600 });
+    }
     case "/vk/photos.getWallUploadServer":
       return json({ response: { upload_url: `${base}/vkupload` } });
     case "/vkupload": {
@@ -63,6 +76,7 @@ await new Promise((r) => server.listen(0, r));
 const base = `http://localhost:${server.address().port}`;
 
 process.env.VK_API_BASE = `${base}/vk`;
+process.env.VKID_API_BASE = `${base}/vkid`;
 process.env.MAX_API_BASE = `${base}/max`;
 process.env.VK_GROUP_ID = "228959585";
 process.env.VK_USER_TOKEN = "vk-test-token";
@@ -73,7 +87,7 @@ process.env.TG_API_BASE = `${base}/tg`;
 process.env.TG_CHANNEL_BOT_TOKEN = "tg-channel-token";
 
 const { registerCrosspost } = await import("../crosspost-inbox.js");
-const { postVk, collectMedia, postTelegramChannel } = await import("../crosspost.js");
+const { postVk, collectMedia, postTelegramChannel, vkToken, loadCrosspostConfig } = await import("../crosspost.js");
 
 // --- заглушка grammy ---
 const commands = {};
@@ -298,3 +312,31 @@ test("в Telegram-канал рерайт уходит с видео в одно
 });
 
 test.after(() => server.close());
+
+test("VK ID: два одновременных запроса — одно обновление, новый ключ сохраняется", async () => {
+  const stateFile = join(mkdtempSync(join(tmpdir(), "vkid-")), "vkid_state.json");
+  const env = { VK_GROUP_ID: "228959585", VKID_REFRESH_TOKEN: "r1", VKID_DEVICE_ID: "d1", VKID_STATE_FILE: stateFile };
+  const cfg = loadCrosspostConfig(env);
+  assert.ok(cfg.vkReady);
+  const before = calls.filter((c) => c.path === "/vkid/oauth2/auth").length;
+  const [t1, t2] = await Promise.all([vkToken(cfg), vkToken(cfg)]);
+  assert.equal(t1, "a1");
+  assert.equal(t2, "a1");
+  assert.equal(calls.filter((c) => c.path === "/vkid/oauth2/auth").length - before, 1);
+  assert.equal(JSON.parse(readFileSync(stateFile, "utf8")).refresh_token, "r2");
+  // пока токен свежий — в VK ID не ходим
+  assert.equal(await vkToken(cfg), "a1");
+  assert.equal(calls.filter((c) => c.path === "/vkid/oauth2/auth").length - before, 1);
+  // истёк — обновляемся уже сохранённым r2, а не сгоревшим r1 из панели
+  const st = JSON.parse(readFileSync(stateFile, "utf8"));
+  writeFileSync(stateFile, JSON.stringify({ ...st, expires_at: 0 }));
+  assert.equal(await vkToken(cfg), "a2");
+  // новый вход, вписанный в панель, главнее файла
+  assert.equal(await vkToken(loadCrosspostConfig({ ...env, VKID_REFRESH_TOKEN: "r9" })), "a9");
+});
+
+test("VK ID: слетевший вход даёт понятную ошибку с подсказкой", async () => {
+  const stateFile = join(mkdtempSync(join(tmpdir(), "vkid-")), "vkid_state.json");
+  const cfg = loadCrosspostConfig({ VK_GROUP_ID: "1", VKID_REFRESH_TOKEN: "dead", VKID_DEVICE_ID: "d", VKID_STATE_FILE: stateFile });
+  await assert.rejects(vkToken(cfg), /перевыпусти VK для бота/);
+});

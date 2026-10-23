@@ -5,7 +5,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync, truncateSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -87,7 +87,7 @@ process.env.TG_API_BASE = `${base}/tg`;
 process.env.TG_CHANNEL_BOT_TOKEN = "tg-channel-token";
 
 const { registerCrosspost } = await import("../crosspost-inbox.js");
-const { postVk, collectMedia, postTelegramChannel, vkToken, loadCrosspostConfig } = await import("../crosspost.js");
+const { postVk, collectMedia, postTelegramChannel, vkToken, loadCrosspostConfig, cleanupMedia } = await import("../crosspost.js");
 
 // --- заглушка grammy ---
 const commands = {};
@@ -339,4 +339,70 @@ test("VK ID: слетевший вход даёт понятную ошибку 
   const stateFile = join(mkdtempSync(join(tmpdir(), "vkid-")), "vkid_state.json");
   const cfg = loadCrosspostConfig({ VK_GROUP_ID: "1", VKID_REFRESH_TOKEN: "dead", VKID_DEVICE_ID: "d", VKID_STATE_FILE: stateFile });
   await assert.rejects(vkToken(cfg), /перевыпусти VK для бота/);
+});
+
+// --- файлы тяжелее лимитов Bot API (MTProto, bigfiles.js) ---
+const withMtproto = async (fn) => {
+  process.env.TG_API_ID = "123";
+  process.env.TG_API_HASH = "abc";
+  try {
+    return await fn();
+  } finally {
+    delete process.env.TG_API_ID;
+    delete process.env.TG_API_HASH;
+  }
+};
+const MB = 1024 * 1024;
+
+test("без MTProto видео тяжелее 20 МБ пропускается с понятным предупреждением", async () => {
+  const { media, warnings } = await collectMedia("t", [
+    { kind: "video", fileId: "f", fileSize: 30 * MB, filename: "big.mp4", msgId: 5 },
+  ]);
+  assert.equal(media.length, 0);
+  assert.match(warnings[0], /20 МБ/);
+});
+
+test("с MTProto тяжёлое видео скачивается по номеру сообщения и потом убирается", async () => {
+  await withMtproto(async () => {
+    const dir = mkdtempSync(join(tmpdir(), "big-"));
+    const asked = [];
+    const { media, warnings } = await collectMedia(
+      "t",
+      [{ kind: "video", fileId: "f", fileSize: 300 * MB, filename: "big.mp4", msgId: 77, w: 1080, h: 1920, duration: 31 }],
+      {
+        download: async (_tok, it) => {
+          asked.push(it.msgId);
+          const p = join(dir, it.filename);
+          writeFileSync(p, "x");
+          return p;
+        },
+      }
+    );
+    assert.deepEqual(asked, [77]);
+    assert.equal(warnings.length, 0);
+    assert.equal(media[0].path, join(dir, "big.mp4"));
+    assert.equal(media[0].h, 1920);
+    cleanupMedia(media);
+    assert.equal(existsSync(dir), false);
+  });
+});
+
+test("в канал вложение тяжелее 50 МБ уходит через MTProto, подпись под альбомом", async () => {
+  await withMtproto(async () => {
+    const p = join(mkdtempSync(join(tmpdir(), "big-")), "big.mp4");
+    writeFileSync(p, "");
+    truncateSync(p, 60 * MB); // разреженный файл — места на диске не ест
+    const cfg = loadCrosspostConfig();
+    const sentVia = [];
+    const before = calls.filter((c) => c.path.endsWith("/sendMediaGroup")).length;
+    const r = await postTelegramChannel(cfg, "короткий рерайт", [{ kind: "video", filename: "big.mp4", path: p }], {
+      sendBig: async (token, chat, items, caption) => {
+        sentVia.push({ token, chat, n: items.length, caption });
+        return [777];
+      },
+    });
+    assert.deepEqual(sentVia, [{ token: "tg-channel-token", chat: "@" + CHANNEL, n: 1, caption: "короткий рерайт" }]);
+    assert.equal(r.url, `https://t.me/${CHANNEL}/777`);
+    assert.equal(calls.filter((c) => c.path.endsWith("/sendMediaGroup")).length, before);
+  });
 });

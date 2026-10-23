@@ -15,8 +15,10 @@
 //  - MAX нужно время на обработку видео перед отправкой сообщения;
 //  - форматирование (bold/italic) никуда не переносится — везде плоский текст.
 
-import { readFileSync, writeFileSync, existsSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, openAsBlob, statSync, rmSync } from "fs";
+import { dirname } from "path";
 import { fileURLToPath } from "url";
+import { mtprotoReady, downloadBig, sendAlbumBig } from "./bigfiles.js";
 
 // Базы API вынесены в переменные окружения только ради офлайн-тестов
 // (test/crosspost.test.js поднимает заглушку) — в бою их задавать не нужно.
@@ -27,6 +29,7 @@ const MAX_API = process.env.MAX_API_BASE || "https://botapi.max.ru";
 const TG_API = process.env.TG_API_BASE || "https://api.telegram.org";
 const MAX_TEXT_LIMIT = 4000;
 const TG_FILE_LIMIT = 20 * 1024 * 1024; // Bot API не отдаёт файлы тяжелее 20 МБ
+const TG_UPLOAD_LIMIT = 50 * 1024 * 1024; // и не принимает загрузки тяжелее 50 МБ
 
 export function loadCrosspostConfig(env = process.env) {
   const cfg = {
@@ -196,9 +199,19 @@ async function vkCall(method, params) {
   return j.response;
 }
 
+// Тяжёлое видео держим на диске и отдаём потоком: сотни мегабайт в памяти
+// контейнера на bothost — лишний риск.
+async function blobOf(item) {
+  return item.path ? openAsBlob(item.path) : new Blob([item.buffer]);
+}
+
+function sizeOf(item) {
+  return item.path ? statSync(item.path).size : item.buffer?.length || 0;
+}
+
 async function uploadFile(url, field, item, label) {
   const fd = new FormData();
-  fd.append(field, new Blob([item.buffer]), item.filename);
+  fd.append(field, await blobOf(item), item.filename);
   const { status, text } = await fetchText(url, { method: "POST", body: fd }, label);
   try {
     return JSON.parse(text);
@@ -356,7 +369,7 @@ async function tgCall(cfg, method, payload, isForm = false) {
   return j.result;
 }
 
-export async function postTelegramChannel(cfg, text, media) {
+export async function postTelegramChannel(cfg, text, media, { sendBig = sendAlbumBig } = {}) {
   const chat = cfg.tg.channel;
   // Фото и видео идут одной медиагруппой (Telegram разрешает их смешивать);
   // остальное (документы) в канал не кладём.
@@ -371,7 +384,13 @@ export async function postTelegramChannel(cfg, text, media) {
   // Короткий текст с вложениями — одним сообщением, подписью под ними.
   const asCaption = items.length && text.length <= TG_CAPTION_LIMIT;
 
-  if (items.length) {
+  const heavy = items.some((m) => sizeOf(m) > TG_UPLOAD_LIMIT);
+  if (items.length && heavy) {
+    if (!mtprotoReady()) {
+      throw new Error("вложение тяжелее 50 МБ — Bot API такое в канал не грузит, нужны TG_API_ID/TG_API_HASH");
+    }
+    ids.push(...(await sendBig(cfg.tg.token, chat, items, asCaption ? text : "")));
+  } else if (items.length) {
     const fd = new FormData();
     fd.append("chat_id", chat);
     const groupMedia = items.map((m, i) => ({
@@ -380,7 +399,7 @@ export async function postTelegramChannel(cfg, text, media) {
       ...(asCaption && i === 0 ? { caption: text } : {}),
     }));
     fd.append("media", JSON.stringify(groupMedia));
-    items.forEach((m, i) => fd.append(`m${i}`, new Blob([m.buffer]), m.filename));
+    for (const [i, m] of items.entries()) fd.append(`m${i}`, await blobOf(m), m.filename);
     const sent = await tgCall(cfg, "sendMediaGroup", fd, true);
     ids.push(...sent.map((m) => m.message_id));
   }
@@ -452,10 +471,19 @@ export async function checkPlatforms(cfg) {
 
 // ---------- Сборка вложений заявки ----------
 
-export async function collectMedia(botToken, items) {
+export async function collectMedia(botToken, items, { download = downloadBig } = {}) {
   const media = [];
   const warnings = [];
   for (const it of items) {
+    if (it.fileSize && it.fileSize > TG_FILE_LIMIT && mtprotoReady() && it.msgId) {
+      try {
+        const path = await download(botToken, it);
+        media.push({ kind: it.kind, filename: it.filename, path, w: it.w, h: it.h, duration: it.duration });
+      } catch (e) {
+        warnings.push(`${it.filename}: тяжёлый файл не скачался по MTProto — ${e.message}`);
+      }
+      continue;
+    }
     if (it.fileSize && it.fileSize > TG_FILE_LIMIT) {
       warnings.push(
         `${it.filename}: ${(it.fileSize / 1048576).toFixed(1)} МБ — Bot API не отдаёт файлы тяжелее 20 МБ, вложение пропущено`
@@ -464,7 +492,7 @@ export async function collectMedia(botToken, items) {
     }
     try {
       const { buffer } = await tgDownload(botToken, it.fileId);
-      media.push({ kind: it.kind, filename: it.filename, buffer });
+      media.push({ kind: it.kind, filename: it.filename, buffer, w: it.w, h: it.h, duration: it.duration });
     } catch (e) {
       warnings.push(`${it.filename}: ${e.message}`);
     }
@@ -472,4 +500,15 @@ export async function collectMedia(botToken, items) {
   return { media, warnings };
 }
 
-export { TG_FILE_LIMIT, MAX_TEXT_LIMIT };
+// Временные папки тяжёлых файлов (bigfiles.js кладёт каждый в свою) — убрать после публикации.
+export function cleanupMedia(media) {
+  for (const m of media || []) {
+    if (m.path) {
+      try {
+        rmSync(dirname(m.path), { recursive: true, force: true });
+      } catch {}
+    }
+  }
+}
+
+export { TG_FILE_LIMIT, TG_UPLOAD_LIMIT, MAX_TEXT_LIMIT };

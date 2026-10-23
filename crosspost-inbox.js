@@ -23,7 +23,9 @@ import {
   postTelegramChannel,
   checkPlatforms,
   TG_FILE_LIMIT,
+  cleanupMedia,
 } from "./crosspost.js";
+import { mtprotoReady, MTPROTO_FILE_LIMIT } from "./bigfiles.js";
 
 const CONFIRM = new Set(["+", "да", "ок", "окей", "ok", "go", "поехали", "дубль", "публикуй"]);
 const CANCEL = new Set(["-", "нет", "отмена", "стоп", "cancel", "не надо"]);
@@ -79,9 +81,12 @@ export function registerCrosspost(bot, { botToken, isOwner, dir, onRewrite }) {
   function mediaFromMessage(msg) {
     const out = [];
     const id = msg.message_id;
+    // msgId нужен, чтобы тяжёлый файл скачать по MTProto (bigfiles.js),
+    // размеры кадра и длительность — чтобы видео в канале не стало «файлом»
+    const at = (o) => ({ msgId: id, w: o?.width, h: o?.height, duration: o?.duration });
     if (msg.photo?.length) {
       const best = msg.photo[msg.photo.length - 1]; // размеры отсортированы по возрастанию
-      out.push({ kind: "photo", fileId: best.file_id, fileSize: best.file_size, filename: `photo_${id}.jpg` });
+      out.push({ kind: "photo", fileId: best.file_id, fileSize: best.file_size, filename: `photo_${id}.jpg`, ...at(best) });
     }
     if (msg.video) {
       out.push({
@@ -89,16 +94,17 @@ export function registerCrosspost(bot, { botToken, isOwner, dir, onRewrite }) {
         fileId: msg.video.file_id,
         fileSize: msg.video.file_size,
         filename: msg.video.file_name || `video_${id}.mp4`,
+        ...at(msg.video),
       });
     }
     if (msg.animation) {
-      out.push({ kind: "video", fileId: msg.animation.file_id, fileSize: msg.animation.file_size, filename: `animation_${id}.mp4` });
+      out.push({ kind: "video", fileId: msg.animation.file_id, fileSize: msg.animation.file_size, filename: `animation_${id}.mp4`, ...at(msg.animation) });
     }
     if (msg.document) {
       const mime = msg.document.mime_type || "";
       const kind = mime.startsWith("image/") ? "photo" : mime.startsWith("video/") ? "video" : null;
       if (kind) {
-        out.push({ kind, fileId: msg.document.file_id, fileSize: msg.document.file_size, filename: msg.document.file_name || `document_${id}` });
+        out.push({ kind, fileId: msg.document.file_id, fileSize: msg.document.file_size, filename: msg.document.file_name || `document_${id}`, ...at(null) });
       }
     }
     return out;
@@ -239,9 +245,10 @@ export function registerCrosspost(bot, { botToken, isOwner, dir, onRewrite }) {
       const out = (await onRewrite(sourceText)) || "";
       if (!out.trim()) throw new Error("вернулся пустой текст");
 
-      // Видео тяжелее 20 МБ Bot API всё равно не скачает (упадёт молча при публикации) —
-      // отсеиваем сразу и просим сжатую замену, а не ждём до "+".
-      const oversized = media.filter((m) => m.kind === "video" && m.fileSize > TG_FILE_LIMIT);
+      // Видео тяжелее 20 МБ Bot API не скачает. С MTProto (TG_API_ID/TG_API_HASH)
+      // бот берёт до 2 ГБ сам; без него — отсеиваем сразу и просим сжатую замену.
+      const limit = mtprotoReady() ? MTPROTO_FILE_LIMIT : TG_FILE_LIMIT;
+      const oversized = media.filter((m) => m.kind === "video" && m.fileSize > limit);
       const usable = media.filter((m) => !oversized.includes(m));
 
       lastRewriteSource = sourceText;
@@ -260,7 +267,7 @@ export function registerCrosspost(bot, { botToken, isOwner, dir, onRewrite }) {
           .map((m) => `${m.filename} (${(m.fileSize / 1048576).toFixed(1)} МБ)`)
           .join(", ");
         await ctx.reply(
-          `⚠️ ${list} — тяжелее 20 МБ, Bot API такое не скачивает, вложение пропустил.\n` +
+          `⚠️ ${list} — тяжелее ${mtprotoReady() ? "2 ГБ, Telegram такое боту не отдаёт" : "20 МБ, Bot API такое не скачивает"}, вложение пропустил.\n` +
             `Сожми видео и пришли сжатую версию отдельным сообщением без подписи — прикреплю к этой заявке.`
         );
       }
@@ -294,6 +301,14 @@ export function registerCrosspost(bot, { botToken, isOwner, dir, onRewrite }) {
   async function publishJob(ctx, job) {
     await ctx.reply("Публикую…");
     const { media, warnings } = await collectMedia(botToken, job.media);
+    try {
+      await publishCollected(ctx, job, media, warnings);
+    } finally {
+      cleanupMedia(media); // тяжёлые файлы лежат во временной папке — не копим их
+    }
+  }
+
+  async function publishCollected(ctx, job, media, warnings) {
     const lines = [];
     const allWarnings = [...warnings];
     const plats = platformsOf(job.kind || "dub");

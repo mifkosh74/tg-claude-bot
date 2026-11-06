@@ -11,8 +11,8 @@
 // (vk.ru/im/channels/-235311764) закрыт для любых API — только руками через
 // браузер. Поэтому после публикации бот сам напоминает про него.
 
-import { readFileSync, writeFileSync, existsSync } from "fs";
 import { join } from "path";
+import { dataDir, loadJson, saveAtomic } from "./storage.js";
 import {
   loadCrosspostConfig,
   describeConfig,
@@ -38,9 +38,12 @@ const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 // из чата смысла нет, а вот пост из чужого канала — почти всегда да.
 const REWRITE_MIN_LENGTH = 150;
 
+const failed = (result) => String(result).startsWith("ERROR");
+
 export function registerCrosspost(bot, { botToken, isOwner, dir, onRewrite }) {
   const cfg = loadCrosspostConfig();
-  const QUEUE_FILE = join(dir, "crosspost_queue.json");
+  // Очередь лежит в постоянной папке хостинга: после «Обновить из Git» заявка всё так же ждёт «+»
+  const QUEUE_FILE = join(dataDir() || dir, "crosspost_queue.json");
 
   const missing = describeConfig(cfg);
   if (missing.length) {
@@ -51,15 +54,10 @@ export function registerCrosspost(bot, { botToken, isOwner, dir, onRewrite }) {
 
   const auto = process.env.CROSSPOST_AUTO === "1";
 
-  let jobs = [];
-  try {
-    if (existsSync(QUEUE_FILE)) jobs = JSON.parse(readFileSync(QUEUE_FILE, "utf8"));
-  } catch (e) {
-    console.error("Очередь дублей не прочиталась, начинаю с пустой:", e.message);
-  }
+  const jobs = loadJson(QUEUE_FILE, [], "Очередь дублей");
   const saveJobs = () => {
     try {
-      writeFileSync(QUEUE_FILE, JSON.stringify(jobs.slice(-50), null, 1));
+      saveAtomic(QUEUE_FILE, JSON.stringify(jobs.slice(-50), null, 1));
     } catch (e) {
       console.error("Очередь дублей не сохранилась:", e.message);
     }
@@ -68,6 +66,8 @@ export function registerCrosspost(bot, { botToken, isOwner, dir, onRewrite }) {
   const pending = () =>
     jobs.filter((j) => j.status === "pending" && Date.now() - j.createdAt < JOB_TTL_MS);
   const lastDone = () => [...jobs].reverse().find((j) => j.status === "done");
+  // Заявку старше получаса плюсом уже не подтвердить, поэтому переслать пост заново она не мешает
+  const expired = (j) => j.status === "pending" && Date.now() - j.createdAt >= CONFIRM_WINDOW_MS;
 
   const groupBuffers = new Map(); // media_group_id -> { items, text, timer, srcId }
   let lastForward = null; // последняя пересылка ЛЮБОГО происхождения — для команды /dubl
@@ -130,22 +130,44 @@ export function registerCrosspost(bot, { botToken, isOwner, dir, onRewrite }) {
 
   // Дубль — пост уже вышел в Telegram-канале, туда его повторять не надо.
   // Рерайт — текст новый, он идёт на все площадки, включая сам канал.
-  function platformsOf(kind) {
+  // Площадки, где пост уже вышел (results), второй раз не трогаем.
+  function platformsOf(kind, results = {}) {
     const list = [];
     if (kind === "rewrite" && cfg.tgReady) list.push("telegram");
     if (cfg.vkReady) list.push("vk");
     if (cfg.maxReady) list.push("max");
-    return list;
+    return list.filter((p) => !results[p] || failed(results[p]));
   }
 
   const PLATFORM_NAMES = { telegram: "Telegram", vk: "VK", max: "MAX" };
+
+  // Публикацию оборвало обновление бота. Сами не повторяем: часть могла уже выйти,
+  // а статус «approved» подхватил бы её следующий «+» вместе с новым постом.
+  const interrupted = jobs.filter((j) => j.status === "approved");
+  for (const j of interrupted) j.status = "error";
+  if (interrupted.length) saveJobs();
+  for (const j of interrupted) {
+    const out = Object.entries(j.results).filter(([, v]) => !failed(v)).map(([p]) => PLATFORM_NAMES[p]);
+    void bot.api
+      .sendMessage(
+        j.chatId,
+        `⚠️ Обновление бота прервало публикацию: «${j.text.trim().slice(0, 60) || describeJob(j)}».\n` +
+          `Точно вышло: ${out.join(", ") || "пока нигде"}. Проверь остальные площадки, пост мог успеть выйти и там.` +
+          (j.srcId ? "\nЕсли его там нет, перешли пост мне ещё раз: опубликую только там, где выход не отмечен." : "")
+      )
+      .catch((e) => console.error("Не смог предупредить о прерванной публикации:", e.message));
+  }
 
   async function enqueue(ctx, { text, media, srcId, kind = "dub" }) {
     if (!text.trim() && !media.length) {
       await ctx.reply("В пересылке нет ни текста, ни вложений — дублировать нечего.");
       return;
     }
-    if (srcId && jobs.some((j) => j.srcId === srcId && j.status !== "cancelled")) {
+    // После ошибки пост можно переслать снова: уйдёт только туда, где не вышел
+    const prev = srcId
+      ? jobs.filter((j) => j.srcId === srcId && j.status !== "cancelled" && !expired(j)).at(-1)
+      : null;
+    if (prev && prev.status !== "error") {
       await ctx.reply(`Пост ${srcId} у меня уже был. Пересылай заново только если предыдущая заявка отменена.`);
       return;
     }
@@ -158,12 +180,12 @@ export function registerCrosspost(bot, { botToken, isOwner, dir, onRewrite }) {
       text,
       media,
       status: "pending",
-      results: {},
+      results: prev ? Object.fromEntries(Object.entries(prev.results).filter(([, v]) => !failed(v))) : {},
     };
     jobs.push(job);
     saveJobs();
 
-    const platforms = platformsOf(kind).map((p) => PLATFORM_NAMES[p]).join(", ");
+    const platforms = platformsOf(kind, job.results).map((p) => PLATFORM_NAMES[p]).join(", ");
     if (!platforms) {
       job.status = "cancelled";
       saveJobs();
@@ -312,8 +334,10 @@ export function registerCrosspost(bot, { botToken, isOwner, dir, onRewrite }) {
   async function publishCollected(ctx, job, media, warnings) {
     const lines = [];
     const allWarnings = [...warnings];
-    const plats = platformsOf(job.kind || "dub");
+    const plats = platformsOf(job.kind || "dub", job.results);
 
+    // Записываем итог после каждой площадки: если обновление оборвёт публикацию,
+    // будет видно, куда пост уже ушёл.
     // Telegram первым: канал — первоисточник, остальные площадки его повторяют.
     if (plats.includes("telegram")) {
       try {
@@ -325,6 +349,7 @@ export function registerCrosspost(bot, { botToken, isOwner, dir, onRewrite }) {
         job.results.telegram = "ERROR: " + e.message;
         lines.push("Telegram: не вышло — " + e.message);
       }
+      saveJobs();
     }
 
     if (plats.includes("vk")) {
@@ -338,6 +363,7 @@ export function registerCrosspost(bot, { botToken, isOwner, dir, onRewrite }) {
         job.results.vk = "ERROR: " + e.message;
         lines.push("VK: не вышло — " + e.message);
       }
+      saveJobs();
     }
     if (plats.includes("max")) {
       try {
@@ -351,9 +377,7 @@ export function registerCrosspost(bot, { botToken, isOwner, dir, onRewrite }) {
       }
     }
 
-    job.status = Object.values(job.results).some((v) => String(v).startsWith("ERROR"))
-      ? "error"
-      : "done";
+    job.status = Object.values(job.results).some(failed) ? "error" : "done";
     job.finishedAt = Date.now();
     saveJobs();
 

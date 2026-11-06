@@ -5,8 +5,8 @@
 // от его имени с подписью агента.
 
 import { InputFile } from "grammy";
-import { readFileSync, writeFileSync, existsSync } from "fs";
 import { join } from "path";
+import { dataDir, loadJson, saveAtomic } from "./storage.js";
 
 const docsBase = () => process.env.GDOCS_BASE || "https://docs.google.com";
 const elevenBase = () => process.env.ELEVEN_API_BASE || "https://api.elevenlabs.io";
@@ -156,15 +156,34 @@ const clip = (s, n) => (s.length > n ? s.slice(0, n).trimEnd() + "…" : s);
 const fileName = (title, v) => `${(title || "Озвучка").replace(/[\\/:*?"<>|]+/g, " ").trim()}_${VOICE.name}_${v}.mp3`;
 
 export function registerVoiceover(bot, { getOwnerId, dir, selectVoiceText, captionJoke, recordOutgoing }) {
-  const JOBS_FILE = join(dir, "voiceover_jobs.json");
-  const jobs = existsSync(JOBS_FILE) ? JSON.parse(readFileSync(JOBS_FILE, "utf8")) : {};
+  // Задания лежат в постоянной папке хостинга: после «Обновить из Git» кнопки под озвучкой работают,
+  // а сами файлы хранит Telegram (file_id)
+  const JOBS_FILE = join(dataDir() || dir, "voiceover_jobs.json");
+  const jobs = loadJson(JOBS_FILE, {}, "Задания озвучки");
   const save = () => {
     const keep = Object.values(jobs).sort((a, b) => b.createdAt - a.createdAt).slice(0, 30);
-    writeFileSync(JOBS_FILE, JSON.stringify(Object.fromEntries(keep.map((j) => [j.id, j])), null, 1));
+    try {
+      saveAtomic(JOBS_FILE, JSON.stringify(Object.fromEntries(keep.map((j) => [j.id, j])), null, 1));
+    } catch (e) {
+      console.error("Задания озвучки не сохранились:", e.message);
+    }
   };
   const toOwner = (text, extra = {}) =>
     bot.api.sendMessage(getOwnerId(), text, { parse_mode: "HTML", link_preview_options: { is_disabled: true }, ...extra });
   const kb = (rows) => ({ reply_markup: { inline_keyboard: rows } });
+
+  // Озвучку, которую оборвало обновление бота, никто не доделает: без этого её кнопка
+  // вечно отвечала бы «Уже озвучиваю». Отправку можно просто нажать ещё раз.
+  const stopped = Object.values(jobs).filter((j) => j.status === "working");
+  for (const job of Object.values(jobs)) if (job.status === "sending") job.status = "ready";
+  for (const job of stopped) job.status = "failed";
+  save();
+  for (const job of stopped) {
+    void toOwner(
+      `Обновление бота прервало озвучку${job.title ? ` «${esc(job.title)}»` : ""}. Запустить заново?`,
+      kb([[{ text: "🔁 Ещё раз", callback_data: `vo:go:${job.id}` }]])
+    ).catch((e) => console.error("Не смог предупредить о прерванной озвучке:", e.message));
+  }
 
   // Новое сообщение от Зиры. Возвращает true, если это задание на озвучку.
   async function onIncoming(msg, connId) {

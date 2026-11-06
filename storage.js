@@ -6,7 +6,7 @@
 // поэтому проверяем и сам путь. Локально нет ни того ни другого: тогда null,
 // и файлы лежат рядом с кодом, как раньше.
 
-import { accessSync, constants, existsSync, mkdirSync, renameSync, writeFileSync } from "fs";
+import { accessSync, constants, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "fs";
 import { basename, dirname, join } from "path";
 
 const BOTHOST_DATA = "/app/data";
@@ -33,4 +33,15 @@ export function saveAtomic(file, text) {
   mkdirSync(dirname(tmp), { recursive: true });
   writeFileSync(tmp, text, { mode: 0o600 });
   renameSync(tmp, file);
+}
+
+// На томе битый файл сам уже не исчезнет: падать на нём при старте нельзя, бот не поднимется.
+// Текст ошибки не логируем: JSON.parse цитирует в нём кусок файла, а там чужие тексты.
+export function loadJson(file, fallback, what) {
+  try {
+    return existsSync(file) ? JSON.parse(readFileSync(file, "utf8")) : fallback;
+  } catch {
+    console.error(`${what}: файл не прочитался, начинаю с пустого`);
+    return fallback;
+  }
 }

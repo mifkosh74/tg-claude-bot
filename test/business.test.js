@@ -355,9 +355,115 @@ test("журнал личек в постоянной папке: редепло
   // обрыв записи: мусор вместо журнала не должен оставлять бота лежать
   const logged = [];
   t.mock.method(console, "error", (...a) => logged.push(a.join(" ")));
-  writeFileSync(join(volume, "business_state.json"), '{"chats": {"556": {"recent": [{"text": "секрет из лички');
+  // JSON.parse цитирует такое начало файла в тексте ошибки
+  writeFileSync(join(volume, "business_state.json"), "секрет из лички");
   const third = freshBusiness(mkdtempSync(join(tmpdir(), "biz-code-")));
   assert.match(await third.lichki(), /Подключение пока не видел/);
+  assert.doesNotMatch(logged.join("\n"), /секрет/);
+});
+
+// --- озвучка после «Обновить из Git» ---
+// Каждый freshVoiceover — новый контейнер: папка с кодом пустая, постоянная папка та же.
+const freshVoiceover = () => {
+  const cbs = [];
+  const sent = [];
+  const vo = registerVoiceover(
+    {
+      callbackQuery: (re, fn) => cbs.push([re, fn]),
+      api: {
+        sendMessage: async (chat_id, text, extra) => (sent.push({ m: "sendMessage", chat_id, text, extra }), {}),
+        sendAudio: async () => ({ audio: { file_id: `file-${Math.random()}`, duration: 60 } }),
+        sendMediaGroup: async (chat_id, media, extra) => (sent.push({ m: "sendMediaGroup", chat_id, media, extra }), []),
+      },
+    },
+    {
+      getOwnerId: () => OWNER,
+      dir: mkdtempSync(join(tmpdir(), "vo-code-")),
+      selectVoiceText: async () => '{"voice":[2],"title":"Тест","language":"en"}',
+    }
+  );
+  const press = async (data) => {
+    const notes = [];
+    const [re, fn] = cbs[0];
+    await fn({
+      from: { id: OWNER },
+      match: data.match(re),
+      answerCallbackQuery: async (o) => notes.push(o?.text || ""),
+      editMessageReplyMarkup: async () => {},
+      reply: async (t) => (notes.push(t), {}),
+    });
+    return notes;
+  };
+  return { jobs: vo.jobs, onIncoming: vo.onIncoming, sent, press };
+};
+const voiceVolume = (t) => {
+  const volume = mkdtempSync(join(tmpdir(), "vo-volume-"));
+  process.env.DATA_DIR = volume;
+  t.after(() => delete process.env.DATA_DIR);
+  return volume;
+};
+
+test("озвучка в постоянной папке: после обновления кнопка «Отправить» работает", async (t) => {
+  voiceVolume(t);
+  const first = freshVoiceover();
+  await first.onIncoming(
+    { chat: { id: ZIRA }, from: { first_name: "Зира" }, text: "https://docs.google.com/document/d/OPEN_DOC_1234567890abcdef/edit" },
+    CONN
+  );
+  const id = Object.keys(first.jobs)[0];
+  await first.press(`vo:go:${id}`);
+  assert.ok(await waitFor(() => first.jobs[id].status === "ready"));
+  const files = first.jobs[id].takes.map((take) => take.fileId);
+
+  const second = freshVoiceover();
+  assert.deepEqual(second.sent, [], "готовая озвучка не считается прерванной");
+  const notes = await second.press(`vo:send:${id}`);
+  const group = second.sent.find((s) => s.m === "sendMediaGroup");
+  assert.equal(group.chat_id, ZIRA);
+  assert.equal(group.extra.business_connection_id, CONN);
+  assert.deepEqual(group.media.map((m) => m.media), files);
+  assert.ok(notes.some((n) => /Отправил в чат «Зира»/.test(n)), notes.join(" | "));
+});
+
+test("обновление оборвало озвучку: не висит в «Уже озвучиваю», Николаю кнопка «Ещё раз»", async (t) => {
+  const volume = voiceVolume(t);
+  const job = (id, status) => ({
+    id,
+    createdAt: Date.now(),
+    chatId: ZIRA,
+    connId: CONN,
+    who: "Зира",
+    title: "Тест",
+    language: "en",
+    text: "Hello there",
+    excluded: [],
+    status,
+    takes: [],
+  });
+  writeFileSync(join(volume, "voiceover_jobs.json"), JSON.stringify({ cut: job("cut", "working"), half: job("half", "sending") }));
+
+  const vo = freshVoiceover();
+  assert.equal(vo.sent.length, 1);
+  assert.equal(vo.sent[0].chat_id, OWNER);
+  assert.match(vo.sent[0].text, /прервало озвучку «Тест»/);
+  assert.deepEqual(vo.sent[0].extra.reply_markup.inline_keyboard.flat().map((b) => b.callback_data), ["vo:go:cut"]);
+  assert.equal(vo.jobs.half.status, "ready", "оборванную отправку можно нажать ещё раз");
+
+  const notes = await vo.press("vo:go:cut");
+  assert.ok(notes.includes("Озвучиваю"), notes.join(" | "));
+  assert.ok(await waitFor(() => vo.jobs.cut.status === "ready"));
+
+  assert.equal(freshVoiceover().sent.length, 0, "при следующем запуске предупреждение не повторяется");
+});
+
+test("битый файл заданий озвучки не роняет бота и не попадает в лог", async (t) => {
+  const volume = voiceVolume(t);
+  // JSON.parse цитирует такое начало файла в тексте ошибки
+  writeFileSync(join(volume, "voiceover_jobs.json"), "секрет из дока");
+  const logged = [];
+  t.mock.method(console, "error", (...a) => logged.push(a.join(" ")));
+  assert.deepEqual(freshVoiceover().jobs, {});
+  assert.match(logged.join("\n"), /Задания озвучки: файл не прочитался/);
   assert.doesNotMatch(logged.join("\n"), /секрет/);
 });
 

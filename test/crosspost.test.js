@@ -577,3 +577,127 @@ test("видео, отправленное файлом без animation, ост
   assert.match(ctx.replies.join("\n"), /1 видео/, ctx.replies.join(" | "));
   await feed(ctxFor({ message_id: 504, text: "-" }));
 });
+
+// --- очередь дублей после «Обновить из Git» ---
+// Каждый freshInbox — новый контейнер: папка с кодом пустая, постоянная папка та же.
+const freshInbox = () => {
+  const handlers = [];
+  const sent = [];
+  registerCrosspost(
+    {
+      command: () => {},
+      on: (filter, fn) => filter === "message" && handlers.push(fn),
+      api: { sendMessage: async (chat, text) => (sent.push({ chat, text }), {}) },
+    },
+    { botToken: "tg-test-token", isOwner: (ctx) => ctx.from?.id === OWNER, dir: mkdtempSync(join(tmpdir(), "cp-code-")) }
+  );
+  const say = async (message) => {
+    const ctx = ctxFor(message);
+    await handlers[0](ctx, async () => {});
+    return ctx;
+  };
+  return { say, sent };
+};
+const volumeWith = (t, jobs) => {
+  const volume = mkdtempSync(join(tmpdir(), "cp-volume-"));
+  process.env.DATA_DIR = volume;
+  t.after(() => delete process.env.DATA_DIR);
+  if (jobs) writeFileSync(join(volume, "crosspost_queue.json"), JSON.stringify(jobs));
+  return volume;
+};
+const savedJob = (over) => ({ id: over.srcId, createdAt: Date.now(), chatId: OWNER, kind: "dub", media: [], results: {}, ...over });
+const fromChannel = (srcId, text) =>
+  forwarded({ message_id: srcId, forward_origin: { type: "channel", chat: { id: -1001789234008, username: CHANNEL }, message_id: srcId }, text });
+const plus = { message_id: 9000, text: "+" };
+const postedTo = (path, text) => calls.filter((c) => c.path === path && c.body.includes(text)).length;
+
+test("очередь в постоянной папке: после обновления заявка ждёт «+», а вышедший пост не дублируется", async (t) => {
+  const volume = volumeWith(t);
+  const first = freshInbox();
+  assert.match((await first.say(fromChannel(2001, "survivor2001"))).replies.join("\n"), /Принял на дубль/);
+  assert.ok(existsSync(join(volume, "crosspost_queue.json")));
+
+  const second = freshInbox();
+  assert.deepEqual(second.sent, [], "ждущая заявка не считается прерванной");
+  const ctx = await second.say(plus);
+  assert.ok(await waitFor(ctx, "mid.test123"), ctx.replies.join(" | "));
+  assert.equal(postedTo("/vk/wall.post", "survivor2001"), 1);
+  assert.equal(postedTo("/max/messages", "survivor2001"), 1);
+
+  const third = freshInbox();
+  assert.match((await third.say(fromChannel(2001, "survivor2001"))).replies.join("\n"), /уже был/);
+});
+
+test("обновление оборвало публикацию: старый пост не уезжает со следующим «+», Николай предупреждён", async (t) => {
+  volumeWith(t, [savedJob({ srcId: 2002, text: "stale2002", status: "approved", results: { vk: "https://vk.com/wall-1_1" } })]);
+  const inbox = freshInbox();
+  assert.equal(inbox.sent.length, 1);
+  assert.equal(inbox.sent[0].chat, OWNER);
+  assert.match(inbox.sent[0].text, /прервало публикацию: «stale2002»/);
+  assert.match(inbox.sent[0].text, /Точно вышло: VK\./);
+
+  await inbox.say(fromChannel(2003, "fresh2003"));
+  const ctx = await inbox.say(plus);
+  assert.ok(await waitFor(ctx, "mid.test123"), ctx.replies.join(" | "));
+  assert.equal(postedTo("/vk/wall.post", "fresh2003"), 1);
+  assert.equal(postedTo("/vk/wall.post", "stale2002"), 0, "оборванный пост не должен уехать вместе с новым");
+  assert.equal(postedTo("/max/messages", "stale2002"), 0, "оборванный пост не должен уехать вместе с новым");
+
+  // переслал заново: только туда, где выход не отмечен
+  assert.match((await inbox.say(fromChannel(2002, "stale2002"))).replies.join("\n"), /Публикую в MAX —/);
+  const redo = await inbox.say(plus);
+  assert.ok(await waitFor(redo, "mid.test123"), redo.replies.join(" | "));
+  assert.equal(postedTo("/vk/wall.post", "stale2002"), 0);
+  assert.equal(postedTo("/max/messages", "stale2002"), 1);
+
+  assert.equal(freshInbox().sent.length, 0, "при следующем запуске предупреждение не повторяется");
+});
+
+test("публикация записывает итог после каждой площадки, а не только в конце", async (t) => {
+  const volume = volumeWith(t);
+  const inbox = freshInbox();
+  await inbox.say(fromChannel(2007, "progress2007"));
+  // что лежало на диске в момент, когда VK уже позади, а MAX ещё нет
+  let onDisk;
+  const origFetch = globalThis.fetch;
+  t.mock.method(globalThis, "fetch", (url, opts) => {
+    if (String(url).includes("/max/messages")) {
+      onDisk = JSON.parse(readFileSync(join(volume, "crosspost_queue.json"), "utf8")).find((j) => j.srcId === 2007);
+    }
+    return origFetch(url, opts);
+  });
+  const ctx = await inbox.say(plus);
+  assert.ok(await waitFor(ctx, "mid.test123"), ctx.replies.join(" | "));
+  assert.equal(onDisk.status, "approved");
+  assert.equal(onDisk.results.vk, "https://vk.com/wall-228959585_999");
+});
+
+test("пост с ошибкой можно переслать снова: уйдёт только туда, где не вышел; просроченная заявка не мешает", async (t) => {
+  volumeWith(t, [
+    savedJob({ srcId: 2004, text: "failed2004", status: "error", results: { vk: "ERROR: нет входа", max: "mid.ok" } }),
+    savedJob({ srcId: 2005, text: "expired2005", status: "pending", createdAt: Date.now() - 31 * 60 * 1000 }),
+  ]);
+  const inbox = freshInbox();
+  assert.deepEqual(inbox.sent, [], "заявка с ошибкой не считается прерванной");
+  assert.match((await inbox.say(fromChannel(2004, "failed2004"))).replies.join("\n"), /Публикую в VK —/);
+  const ctx = await inbox.say(plus);
+  assert.ok(await waitFor(ctx, "VK: https://vk.com/wall-228959585_999"), ctx.replies.join(" | "));
+  assert.equal(postedTo("/vk/wall.post", "failed2004"), 1);
+  assert.equal(postedTo("/max/messages", "failed2004"), 0, "в MAX пост уже выходил");
+  assert.equal(postedTo("/vk/wall.post", "expired2005"), 0, "«+» не подтверждает заявку старше получаса");
+  assert.match((await inbox.say(fromChannel(2004, "failed2004"))).replies.join("\n"), /уже был/);
+
+  assert.match((await inbox.say(fromChannel(2005, "expired2005"))).replies.join("\n"), /Принял на дубль/);
+});
+
+test("битая очередь в постоянной папке не роняет бота и не попадает в лог", async (t) => {
+  const volume = volumeWith(t);
+  // JSON.parse цитирует такое начало файла в тексте ошибки
+  writeFileSync(join(volume, "crosspost_queue.json"), "секрет из поста");
+  const logged = [];
+  t.mock.method(console, "error", (...a) => logged.push(a.join(" ")));
+  const inbox = freshInbox();
+  assert.match((await inbox.say(fromChannel(2006, "broken2006"))).replies.join("\n"), /Принял на дубль/);
+  assert.match(logged.join("\n"), /Очередь дублей: файл не прочитался/);
+  assert.doesNotMatch(logged.join("\n"), /секрет/);
+});

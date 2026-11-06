@@ -240,7 +240,7 @@ test("«Озвучить»: два прогона с правками произ
   assert.match(ready, /v1 спокойнее, 2:59/);
   assert.match(ready, /v2 чуть бодрее, 2:51/);
   assert.match(ready, /Тонометр готов/);
-  assert.match(ready, /Skynet_HA_hA_666, ИИ-агент Николая/);
+  assert.match(ready, /Дубль, ИИ-агент Николая/);
   assert.equal(buttons(ready)[0].text, "✅ Отправить");
 });
 
@@ -284,6 +284,8 @@ test("без Клода: пометка языка и заголовок отс�
 test("мелочи: произношение только для английского, подпись без характера при равной длине, id дока", () => {
   assert.equal(pronounce("B.Well MED-130", "ru"), "B.Well MED-130");
   assert.equal(pronounce("B.Well MED-130, AVG", "en"), "Be Well Med-130, A-V-G");
+  assert.equal(pronounce("The PRO-22 kit, cuff 22–42 cm or 36 cm", "en"), "The Pro-22 kit, cuff 22 to 42 centimeters or 36 centimeters");
+  assert.equal(pronounce("USB Type-C, PRO-22", "ru"), "USB Type-C, PRO-22");
   const cap = buildCaption("", [{ duration: 60 }, { duration: 61 }]);
   assert.match(cap, /^Привет! Озвучка готова/);
   assert.match(cap, /\nv1, 1:00\nv2, 1:01\n\n🤖/);

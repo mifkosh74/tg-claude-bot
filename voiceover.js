@@ -19,7 +19,7 @@ export const VOICE = {
   settings: { stability: 0.5, similarity_boost: 0.75, style: 0, use_speaker_boost: true, speed: 1.0 },
 };
 
-export const SIGNATURE = "🤖 Skynet_HA_hA_666, ИИ-агент Николая";
+export const SIGNATURE = "🤖 Дубль, ИИ-агент Николая";
 const TTS_CHUNK = 9000; // у multilingual_v2 лимит 10 000 знаков на запрос
 
 export function docIdFrom(text) {
@@ -97,6 +97,9 @@ export function pronounce(text, language = "en") {
   return text
     .replace(/\bB\.\s?Well\b/g, "Be Well")
     .replace(/\bMED-(?=\d)/g, "Med-") // капсом читает по буквам «эм-и-ди»
+    .replace(/\bPRO\b/g, "Pro") // и тут по буквам «пи-эр-о»
+    .replace(/\b(\d+)\s*[–—-]\s*(\d+)\s*cm\b/g, "$1 to $2 cm") // без «to» читает «twenty-two forty-two»
+    .replace(/\bcm\b/g, "centimeters") // «cm» проглатывает или читает как «seven mm»
     .replace(/\bAAA\b/g, "triple-A")
     .replace(/\bAVG\b/g, "A-V-G");
 }

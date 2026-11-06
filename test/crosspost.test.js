@@ -5,9 +5,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { mkdtempSync, readFileSync, writeFileSync, truncateSync, existsSync } from "node:fs";
+import { execFile } from "node:child_process";
+import { mkdtempSync, readFileSync, writeFileSync, truncateSync, existsSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const OWNER = 509801940;
 const CHANNEL = "neurokean_ch";
@@ -33,7 +35,20 @@ const server = http.createServer(async (req, res) => {
     case "/vkid/oauth2/auth": {
       // одноразовые refresh: r1 → r2 → r3; повтор сгоревшего — ошибка, как у VK ID
       const p = new URLSearchParams(body);
-      const chain = { r1: ["a1", "r2"], r2: ["a2", "r3"], r9: ["a9", "r10"] };
+      const chain = {
+        r1: ["a1", "r2"],
+        r2: ["a2", "r3"],
+        r9: ["a9", "r10"],
+        // цепочка для теста редеплоя
+        d1: ["da1", "d2"],
+        d2: ["da2", "d3"],
+        d9: ["da9", "d10"],
+        // запись на диск не удалась
+        w1: ["wa1", "w2"],
+        // /crosspost_check
+        c1: ["ca1", "c2"],
+        c5: ["ca5", "c6"],
+      };
       const hit = chain[p.get("refresh_token")];
       if (!hit || usedRefresh.has(p.get("refresh_token"))) {
         res.statusCode = 400;
@@ -42,6 +57,10 @@ const server = http.createServer(async (req, res) => {
       usedRefresh.add(p.get("refresh_token"));
       return json({ access_token: hit[0], refresh_token: hit[1], expires_in: 3600 });
     }
+    case "/vk/users.get":
+      return json({ response: [{ first_name: "Николай", last_name: "Тест" }] });
+    case "/vk/groups.getById":
+      return json({ response: { groups: [{ name: "Нейрокеан" }] } });
     case "/vk/photos.getWallUploadServer":
       return json({ response: { upload_url: `${base}/vkupload` } });
     case "/vkupload": {
@@ -87,7 +106,10 @@ process.env.TG_API_BASE = `${base}/tg`;
 process.env.TG_CHANNEL_BOT_TOKEN = "tg-channel-token";
 
 const { registerCrosspost } = await import("../crosspost-inbox.js");
-const { postVk, collectMedia, postTelegramChannel, vkToken, loadCrosspostConfig, cleanupMedia } = await import("../crosspost.js");
+const { postVk, collectMedia, postTelegramChannel, vkToken, loadCrosspostConfig, cleanupMedia, checkPlatforms } = await import(
+  "../crosspost.js"
+);
+const { dataDir } = await import("../storage.js");
 
 // --- заглушка grammy ---
 const commands = {};
@@ -339,6 +361,125 @@ test("VK ID: слетевший вход даёт понятную ошибку 
   const stateFile = join(mkdtempSync(join(tmpdir(), "vkid-")), "vkid_state.json");
   const cfg = loadCrosspostConfig({ VK_GROUP_ID: "1", VKID_REFRESH_TOKEN: "dead", VKID_DEVICE_ID: "d", VKID_STATE_FILE: stateFile });
   await assert.rejects(vkToken(cfg), /перевыпусти VK для бота/);
+});
+
+// Новый контейнер после «Обновить из Git»: отдельный процесс Node без памяти прошлого,
+// те же переменные из панели, а файлы рядом с ботом не использует.
+const CROSSPOST_URL = pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), "..", "crosspost.js")).href;
+const runContainer = (env) =>
+  new Promise((resolve, reject) => {
+    const code = `
+      const { vkToken, loadCrosspostConfig } = await import(${JSON.stringify(CROSSPOST_URL)});
+      try { console.log(await vkToken(loadCrosspostConfig())); }
+      catch (e) { console.log("ОШИБКА " + e.message); }`;
+    execFile(
+      process.execPath,
+      ["--input-type=module", "-e", code],
+      { env: { ...process.env, VK_GROUP_ID: "228959585", VKID_DEVICE_ID: "d1", ...env } },
+      (err, stdout, stderr) => (err ? reject(err) : resolve({ out: stdout.trim(), logs: stderr }))
+    );
+  });
+const refreshesFrom = (i) =>
+  calls
+    .slice(i)
+    .filter((c) => c.path === "/vkid/oauth2/auth")
+    .map((c) => new URLSearchParams(c.body).get("refresh_token"));
+
+test("VK ID: редеплой стёр файлы, токен восстановлен из постоянной папки", async () => {
+  const data = join(mkdtempSync(join(tmpdir(), "vkid-volume-")), "data");
+  const panel = { DATA_DIR: data, VKID_REFRESH_TOKEN: "d1" };
+  const stateFile = join(data, "vkid_state.json");
+  const start = calls.length;
+
+  // первый контейнер: новый вход из панели, цепочка ушла в постоянную папку
+  assert.equal((await runContainer(panel)).out, "da1");
+  assert.equal(JSON.parse(readFileSync(stateFile, "utf8")).refresh_token, "d2");
+  assert.deepEqual(readdirSync(join(data, ".tmp")), [], "временный файл не остаётся");
+
+  // редеплой, час ещё не прошёл: в панели всё тот же сгоревший d1, в VK ID не ходим
+  assert.equal((await runContainer(panel)).out, "da1");
+  assert.deepEqual(refreshesFrom(start), ["d1"]);
+
+  // редеплой позже, токен истёк: обновляемся сохранённым d2, сгоревший d1 не трогаем
+  const st = JSON.parse(readFileSync(stateFile, "utf8"));
+  writeFileSync(stateFile, JSON.stringify({ ...st, expires_at: 0 }));
+  const { out, logs } = await runContainer(panel);
+  assert.equal(out, "da2");
+  assert.deepEqual(refreshesFrom(start), ["d1", "d2"]);
+  assert.equal(JSON.parse(readFileSync(stateFile, "utf8")).refresh_token, "d3");
+  // токены не попадают в логи
+  assert.doesNotMatch(logs, /da1|da2|\bd2\b|\bd3\b/);
+
+  // новый вход, вписанный в панель, главнее сохранённой цепочки
+  assert.equal((await runContainer({ ...panel, VKID_REFRESH_TOKEN: "d9" })).out, "da9");
+  assert.equal(JSON.parse(readFileSync(stateFile, "utf8")).seed, "d9");
+});
+
+test("VK ID: без постоянной папки редеплой честно просит новый вход", async () => {
+  // файлов нет совсем, а в панели мёртвое значение
+  const dead = join(mkdtempSync(join(tmpdir(), "vkid-wiped-")), "vkid_state.json");
+  const { out } = await runContainer({ VKID_STATE_FILE: dead, VKID_REFRESH_TOKEN: "burned" });
+  assert.match(out, /^ОШИБКА .*перевыпусти VK для бота/);
+});
+
+test("VK ID: где лежит вход — постоянная папка, запасной путь рядом с кодом", { skip: existsSync("/app/data") }, () => {
+  const dir = join(mkdtempSync(join(tmpdir(), "vkid-dir-")), "nested", "data");
+  assert.equal(dataDir({ DATA_DIR: dir }), dir, "папка создаётся, если её ещё нет");
+  assert.equal(dataDir({}), null);
+  const durable = loadCrosspostConfig({ VKID_REFRESH_TOKEN: "x", DATA_DIR: dir }).vkid;
+  assert.equal(durable.stateFile, join(dir, "vkid_state.json"));
+  assert.equal(durable.durable, true);
+  const local = loadCrosspostConfig({ VKID_REFRESH_TOKEN: "x" }).vkid;
+  assert.equal(local.durable, false);
+  assert.match(local.stateFile, /vkid_state\.json$/);
+
+  // DATA_DIR указывает на файл: писать некуда, остаёмся рядом с кодом, а не падаем
+  const blocker = join(dirname(dir), "blocker");
+  writeFileSync(blocker, "");
+  assert.equal(dataDir({ DATA_DIR: blocker }), null);
+});
+
+test("VK ID: запись на диск не удалась — новый ключ не теряется, токенов в логах нет", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "vkid-noisy-"));
+  const blocker = join(root, "blocked");
+  writeFileSync(blocker, ""); // файл на месте папки: mkdir и запись падают
+  const cfg = loadCrosspostConfig({
+    VK_GROUP_ID: "228959585",
+    VKID_REFRESH_TOKEN: "w1",
+    VKID_DEVICE_ID: "d",
+    VKID_STATE_FILE: join(blocker, "vkid_state.json"),
+  });
+  const logged = [];
+  t.mock.method(console, "error", (...a) => logged.push(a.join(" ")));
+  const start = calls.length;
+
+  assert.equal(await vkToken(cfg), "wa1");
+  // повторный вызов берёт ключ из памяти: w1 сгорел, второго похода в VK ID нет
+  assert.equal(await vkToken(cfg), "wa1");
+  assert.deepEqual(refreshesFrom(start), ["w1"]);
+  assert.ok(logged.length >= 1);
+  assert.doesNotMatch(logged.join("\n"), /wa1|w2/);
+
+  // диск ожил: при следующем обращении состояние записывается
+  rmSync(blocker);
+  assert.equal(await vkToken(cfg), "wa1");
+  assert.equal(JSON.parse(readFileSync(cfg.vkid.stateFile, "utf8")).refresh_token, "w2");
+});
+
+test("/crosspost_check показывает, переживёт ли вход «Обновить из Git»", { skip: existsSync("/app/data") }, async () => {
+  const base = { VK_GROUP_ID: "228959585", VKID_DEVICE_ID: "d" };
+  const dir = join(mkdtempSync(join(tmpdir(), "vkid-check-")), "data");
+  const durable = await checkPlatforms(loadCrosspostConfig({ ...base, VKID_REFRESH_TOKEN: "c1", DATA_DIR: dir }));
+  assert.match(durable.vk, /^ок — токен от Николай Тест/);
+  assert.match(durable.vk, /не сотрёт/);
+  assert.ok(durable.vk.includes(dir));
+  assert.doesNotMatch(durable.vk, /ca1|c2/);
+
+  // постоянной папки нет: предупреждение. Файл рядом с кодом подменяем, чтобы не сорить в репозитории.
+  const local = loadCrosspostConfig({ ...base, VKID_REFRESH_TOKEN: "c5" });
+  local.vkid.stateFile = join(dir, "local_state.json");
+  const warned = await checkPlatforms(local);
+  assert.match(warned.vk, /⚠️ Постоянной папки нет/);
 });
 
 // --- файлы тяжелее лимитов Bot API (MTProto, bigfiles.js) ---

@@ -5,7 +5,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -291,6 +291,74 @@ test("мелочи: произношение только для английс�
   assert.match(cap, /\nv1, 1:00\nv2, 1:01\n\n🤖/);
   assert.equal(docIdFrom("https://docs.google.com/document/u/0/d/1R1-DepBcyg60QlP-VUKfYen6s9j_91-G9xXrZWvWmnA/edit"), "1R1-DepBcyg60QlP-VUKfYen6s9j_91-G9xXrZWvWmnA");
   assert.equal(describeMsg({ voice: { duration: 12 } }), "[голосовое 12 с]");
+});
+
+// --- /lichki и журнал после «Обновить из Git» ---
+const freshBusiness = (dir) => {
+  const cmds = {};
+  const mws = [];
+  const biz = registerBusiness(
+    {
+      use: (fn) => mws.push(fn),
+      command: (name, fn) => (cmds[name] = fn),
+      api: {
+        sendMessage: async () => ({}),
+        // как в настоящем grammY: id строкой
+        getBusinessConnection: async (id) => ({ id, user: { id: OWNER }, is_enabled: true, rights: { can_reply: true } }),
+      },
+      botInfo: { username: "MakedHeadBot" },
+    },
+    { getOwnerId: () => OWNER, dir, schedule: false }
+  );
+  const dispatch = async (update) => {
+    for (const mw of mws) await mw({ update }, async () => {});
+  };
+  const lichki = async () => {
+    let reply = "";
+    await cmds.lichki({ from: { id: OWNER }, chat: { type: "private" }, reply: async (t) => void (reply = t) });
+    return reply;
+  };
+  return { biz, dispatch, lichki };
+};
+
+test("/lichki: пустой журнал после редеплоя — не «Не подключён», а «пока не видел»", async () => {
+  const { dispatch, lichki } = freshBusiness(mkdtempSync(join(tmpdir(), "biz-")));
+  const empty = await lichki();
+  assert.doesNotMatch(empty, /Не подключён|Отключён/);
+  assert.match(empty, /Подключение пока не видел/);
+  assert.match(empty, /Чат-боты → @MakedHeadBot/);
+
+  // первое сообщение в личку: подключение узнано через getBusinessConnection
+  await dispatch(bmsg({ id: 555, name: "Лена" }, { id: 555, name: "Лена" }, "привет"));
+  assert.match(await lichki(), /^Подключён к твоему аккаунту\. Отвечать от твоего имени: можно/);
+
+  // а вот настоящее отключение остаётся отключением
+  await dispatch({ business_connection: { id: CONN, user: { id: OWNER }, is_enabled: false, rights: {} } });
+  assert.match(await lichki(), /^Отключён от твоего аккаунта/);
+});
+
+test("журнал личек в постоянной папке: редеплой его не стирает, битый файл не роняет бота", async (t) => {
+  const volume = mkdtempSync(join(tmpdir(), "biz-volume-"));
+  process.env.DATA_DIR = volume;
+  t.after(() => delete process.env.DATA_DIR);
+
+  const first = freshBusiness(mkdtempSync(join(tmpdir(), "biz-code-")));
+  await first.dispatch(bmsg({ id: 556, name: "Оля" }, { id: 556, name: "Оля" }, "жду ответа"));
+
+  // новый контейнер: папка с кодом другая и пустая, в томе всё на месте
+  const second = freshBusiness(mkdtempSync(join(tmpdir(), "biz-code-")));
+  const after = await second.lichki();
+  assert.match(after, /^Подключён к твоему аккаунту/);
+  assert.match(after, /В журнале чатов: 1, ждут ответа: 1/);
+  assert.equal(second.biz.waiting()[0].name, "Оля");
+
+  // обрыв записи: мусор вместо журнала не должен оставлять бота лежать
+  const logged = [];
+  t.mock.method(console, "error", (...a) => logged.push(a.join(" ")));
+  writeFileSync(join(volume, "business_state.json"), '{"chats": {"556": {"recent": [{"text": "секрет из лички');
+  const third = freshBusiness(mkdtempSync(join(tmpdir(), "biz-code-")));
+  assert.match(await third.lichki(), /Подключение пока не видел/);
+  assert.doesNotMatch(logged.join("\n"), /секрет/);
 });
 
 test.after(() => server.close());

@@ -15,10 +15,11 @@
 //  - MAX нужно время на обработку видео перед отправкой сообщения;
 //  - форматирование (bold/italic) никуда не переносится — везде плоский текст.
 
-import { readFileSync, writeFileSync, existsSync, openAsBlob, statSync, rmSync } from "fs";
-import { dirname } from "path";
+import { readFileSync, existsSync, openAsBlob, statSync, rmSync } from "fs";
+import { dirname, join } from "path";
 import { fileURLToPath } from "url";
 import { mtprotoReady, downloadBig, sendAlbumBig } from "./bigfiles.js";
+import { dataDir, saveAtomic } from "./storage.js";
 
 // Базы API вынесены в переменные окружения только ради офлайн-тестов
 // (test/crosspost.test.js поднимает заглушку) — в бою их задавать не нужно.
@@ -31,6 +32,20 @@ const MAX_TEXT_LIMIT = 4000;
 const TG_FILE_LIMIT = 20 * 1024 * 1024; // Bot API не отдаёт файлы тяжелее 20 МБ
 const TG_UPLOAD_LIMIT = 50 * 1024 * 1024; // и не принимает загрузки тяжелее 50 МБ
 
+// Цепочка входа лежит в постоянной папке хостинга, если она есть (см. storage.js)
+function vkidConfig(env) {
+  const data = env.VKID_STATE_FILE ? null : dataDir(env);
+  return {
+    clientId: env.VKID_CLIENT_ID || "54766200",
+    refreshSeed: env.VKID_REFRESH_TOKEN,
+    deviceId: env.VKID_DEVICE_ID || "",
+    stateFile:
+      env.VKID_STATE_FILE ||
+      (data ? join(data, "vkid_state.json") : fileURLToPath(new URL("./vkid_state.json", import.meta.url))),
+    durable: Boolean(data || env.VKID_STATE_FILE),
+  };
+}
+
 export function loadCrosspostConfig(env = process.env) {
   const cfg = {
     vk: {
@@ -39,14 +54,7 @@ export function loadCrosspostConfig(env = process.env) {
     },
     // Личный токен через VK ID (с 13.10.2026): у бота своя цепочка входа.
     // Если она задана, старый постоянный VK_USER_TOKEN не используется.
-    vkid: env.VKID_REFRESH_TOKEN
-      ? {
-          clientId: env.VKID_CLIENT_ID || "54766200",
-          refreshSeed: env.VKID_REFRESH_TOKEN,
-          deviceId: env.VKID_DEVICE_ID || "",
-          stateFile: env.VKID_STATE_FILE || fileURLToPath(new URL("./vkid_state.json", import.meta.url)),
-        }
-      : null,
+    vkid: env.VKID_REFRESH_TOKEN ? vkidConfig(env) : null,
     max: {
       token: env.MAX_BOT_TOKEN || "",
       chatId: env.MAX_CHAT_ID || "",
@@ -128,10 +136,16 @@ export async function tgDownload(botToken, fileId) {
 // Личный токен VK ID живёт час, а refresh_token одноразовый: каждое обновление
 // выдаёт новый, старый сгорает. Поэтому у бота СВОЙ вход, отдельный от компа
 // (две стороны с одной цепочкой сбивали бы друг друга), а свежий refresh_token
-// хранится в файле рядом с ботом. Файл переживает перезапуск, но не редеплой
-// из Git — тогда бот честно скажет, что нужен новый вход.
+// хранится в постоянной папке хостинга: она переживает и перезапуск, и «Обновить
+// из Git». Значение в панели после первого обновления уже сгорело, но бот им и не
+// пользуется, пока оно совпадает с seed в файле. Новый вход нужен, только если цепочка
+// оборвалась на стороне VK, и тогда бот честно об этом скажет.
 // Обновление строго одно за раз: два параллельных сожгли бы один ключ дважды.
 let vkidRefreshing = null;
+
+// Если запись на диск не удалась, старый ключ уже сгорел, а новый есть только здесь.
+// Без этого следующий вызов прочитал бы с диска сгоревший ключ и оборвал цепочку.
+let vkidUnsaved = null;
 
 function readVkidState(file) {
   try {
@@ -141,10 +155,26 @@ function readVkidState(file) {
   }
 }
 
+function saveVkidState(file, st) {
+  try {
+    saveAtomic(file, JSON.stringify(st));
+    vkidUnsaved = null;
+  } catch (e) {
+    vkidUnsaved = st;
+    console.error(`Вход VK ID не записался на диск, держу в памяти (${e.code || e.message})`);
+  }
+}
+
 export async function vkToken(cfg) {
   const v = cfg.vkid;
   if (!v) return cfg.vk.userToken; // старый постоянный токен
-  let st = readVkidState(v.stateFile);
+  let st;
+  if (vkidUnsaved?.seed === v.refreshSeed) {
+    st = vkidUnsaved;
+    saveVkidState(v.stateFile, st); // диск мог ожить
+  } else {
+    st = readVkidState(v.stateFile);
+  }
   // свежий вход, вписанный в панель, главнее того, что лежит в файле
   if (!st || st.seed !== v.refreshSeed) {
     st = { seed: v.refreshSeed, refresh_token: v.refreshSeed, device_id: v.deviceId };
@@ -162,7 +192,8 @@ export async function vkToken(cfg) {
       const j = await fetchJson(`${VKID_API}/oauth2/auth`, { method: "POST", body }, "VK ID refresh");
       if (!j.access_token) {
         throw new Error(
-          `вход VK ID у бота слетел (${j.error_description || j.error || JSON.stringify(j).slice(0, 150)}). ` +
+          // сам ответ в текст не кладём: ошибка уходит в логи и в чат, а в ответе могут быть токены
+          `вход VK ID у бота слетел (${j.error_description || j.error || "в ответе нет access_token"}). ` +
             "Нужен новый вход: напиши Клоду в Claude Code «перевыпусти VK для бота»."
         );
       }
@@ -172,7 +203,7 @@ export async function vkToken(cfg) {
         refresh_token: j.refresh_token || st.refresh_token,
         expires_at: Date.now() + (j.expires_in || 3600) * 1000,
       };
-      writeFileSync(v.stateFile, JSON.stringify(next));
+      saveVkidState(v.stateFile, next);
       return next.access_token;
     })().finally(() => {
       vkidRefreshing = null;
@@ -181,6 +212,14 @@ export async function vkToken(cfg) {
   return vkidRefreshing;
 }
 
+// Для /crosspost_check: переживёт ли вход следующее «Обновить из Git»
+function vkidStorageNote(v) {
+  if (!v) return "";
+  if (vkidUnsaved) return "\n⚠️ Вход VK не записался на диск, держу в памяти: после перезапуска понадобится новый вход.";
+  return v.durable
+    ? `\nВход VK лежит в ${dirname(v.stateFile)}: «Обновить из Git» его не сотрёт.`
+    : "\n⚠️ Постоянной папки нет (DATA_DIR или /app/data): вход VK лежит рядом с ботом, «Обновить из Git» его сотрёт.";
+}
 
 async function vkCall(method, params) {
   const body = new URLSearchParams({ ...params, v: VK_V });
@@ -435,7 +474,9 @@ export async function checkPlatforms(cfg) {
         group_id: cfg.vk.groupId,
       });
       const group = g.groups?.[0] || g[0] || {};
-      out.vk = `ок — токен от ${me[0].first_name} ${me[0].last_name}, сообщество «${group.name || cfg.vk.groupId}»`;
+      out.vk =
+        `ок — токен от ${me[0].first_name} ${me[0].last_name}, сообщество «${group.name || cfg.vk.groupId}»` +
+        vkidStorageNote(cfg.vkid);
     } catch (e) {
       out.vk = "не отвечает: " + e.message;
     }

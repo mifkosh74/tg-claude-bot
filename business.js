@@ -6,8 +6,9 @@
 // Сам в лички НИКОМУ не пишет: единственная отправка от имени Николая — озвучка
 // Зире, и только по его кнопке.
 
-import { readFileSync, writeFileSync, existsSync } from "fs";
+import { readFileSync, existsSync } from "fs";
 import { join } from "path";
+import { dataDir, saveAtomic } from "./storage.js";
 
 const HOUR = 3600_000;
 
@@ -38,12 +39,23 @@ export function describe(msg) {
   return [kind && `[${kind}]`, text].filter(Boolean).join(" ") || "[сообщение]";
 }
 
+// На томе битый файл сам уже не исчезнет: падать на нём при старте нельзя, бот не поднимется.
+// Текст ошибки не логируем: JSON.parse цитирует в нём кусок файла, а там чужая переписка.
+function loadJournal(file) {
+  const empty = { connections: {}, chats: {}, lastSlot: "", lastSummaryAt: 0 };
+  try {
+    return existsSync(file) ? JSON.parse(readFileSync(file, "utf8")) : empty;
+  } catch {
+    console.error("Журнал личек не прочитался, начинаю с пустого");
+    return empty;
+  }
+}
+
 export function registerBusiness(bot, { getOwnerId, dir, summarize, voiceover, ziraId, schedule = true }) {
-  const FILE = join(dir, "business_state.json");
-  const st = existsSync(FILE)
-    ? JSON.parse(readFileSync(FILE, "utf8"))
-    : { connections: {}, chats: {}, lastSlot: "", lastSummaryAt: 0 };
-  const save = () => writeFileSync(FILE, JSON.stringify(st, null, 1));
+  // Журнал лежит в постоянной папке хостинга: после «Обновить из Git» бот помнит, кто ждёт ответа
+  const FILE = join(dataDir() || dir, "business_state.json");
+  const st = loadJournal(FILE);
+  const save = () => saveAtomic(FILE, JSON.stringify(st, null, 1));
 
   const maxAge = Number(process.env.SUMMARY_MAX_AGE_H || 72) * HOUR;
   const hours = (process.env.SUMMARY_HOURS || "10,14,19").split(",").map(Number).filter((h) => h >= 0 && h < 24);
@@ -196,10 +208,15 @@ export function registerBusiness(bot, { getOwnerId, dir, summarize, voiceover, z
     if (ctx.from?.id !== getOwnerId() || ctx.chat.type !== "private") return;
     const conns = Object.values(st.connections);
     const on = conns.find((c) => c.enabled);
+    const setup = "Настройки → Telegram для бизнеса → Чат-боты → @" + (bot.botInfo?.username || "MakedHeadBot");
+    // Спросить у Telegram «кто ко мне подключён» бот не может: он узнаёт об этом из обновления
+    // или первого сообщения в личку. Пустой список значит «ещё не видел», а не «отключён».
     await ctx.reply(
       (on
         ? `Подключён к твоему аккаунту. Отвечать от твоего имени: ${on.canReply ? "можно" : "нет права"}.`
-        : "Не подключён: Настройки → Telegram для бизнеса → Чат-боты → @" + (bot.botInfo?.username || "MakedHeadBot") + ".") +
+        : conns.length
+          ? `Отключён от твоего аккаунта. Подключить: ${setup}.`
+          : `Подключение пока не видел: узнаю его на первом сообщении в личку. Проверить можно тут: ${setup}.`) +
         `\nВ журнале чатов: ${Object.keys(st.chats).length}, ждут ответа: ${waiting().length}.` +
         `\nСводка в ${hours.join(", ")} ч (UTC${tz >= 0 ? "+" : ""}${tz}), /svodka — прямо сейчас.`
     );

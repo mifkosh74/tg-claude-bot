@@ -406,3 +406,33 @@ test("в канал вложение тяжелее 50 МБ уходит чер�
     assert.equal(calls.filter((c) => c.path.endsWith("/sendMediaGroup")).length, before);
   });
 });
+
+test("GIF считается одним видео, хотя Telegram присылает и animation, и document", async () => {
+  const file = { file_id: "gif-1", file_size: 2398950, width: 720, height: 1280, duration: 6, mime_type: "video/mp4" };
+  const ctx = ctxFor(
+    forwarded({
+      message_id: 501,
+      forward_origin: { type: "channel", chat: { id: -1001789234008, username: CHANNEL }, message_id: 1647 },
+      caption: "Начал работать с блендером",
+      animation: file,
+      document: { ...file, file_name: "animation.mp4" },
+    })
+  );
+  await feed(ctx);
+  assert.match(ctx.replies.join("\n"), /1 видео/, ctx.replies.join(" | "));
+  await feed(ctxFor({ message_id: 502, text: "-" }));
+});
+
+test("видео, отправленное файлом без animation, остаётся одним видео", async () => {
+  const ctx = ctxFor(
+    forwarded({
+      message_id: 503,
+      forward_origin: { type: "channel", chat: { id: -1001789234008, username: CHANNEL }, message_id: 1648 },
+      caption: "Ролик файлом",
+      document: { file_id: "doc-1", file_size: 1000, mime_type: "video/mp4", file_name: "ролик.mp4" },
+    })
+  );
+  await feed(ctx);
+  assert.match(ctx.replies.join("\n"), /1 видео/, ctx.replies.join(" | "));
+  await feed(ctxFor({ message_id: 504, text: "-" }));
+});

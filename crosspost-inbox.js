@@ -100,7 +100,8 @@ export function registerCrosspost(bot, { botToken, isOwner, dir, onRewrite }) {
     if (msg.animation) {
       out.push({ kind: "video", fileId: msg.animation.file_id, fileSize: msg.animation.file_size, filename: `animation_${id}.mp4`, ...at(msg.animation) });
     }
-    if (msg.document) {
+    // у GIF Telegram присылает и animation, и document на один и тот же файл
+    if (msg.document && !msg.animation) {
       const mime = msg.document.mime_type || "";
       const kind = mime.startsWith("image/") ? "photo" : mime.startsWith("video/") ? "video" : null;
       if (kind) {

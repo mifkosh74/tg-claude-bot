@@ -42,6 +42,24 @@ export function paragraphs(text) {
   return text.split("\n").map((s) => s.trim()).filter(Boolean);
 }
 
+// В одном доке бывает несколько роликов: «EU-med-915 … TH-139 распаковка …» (10.11.2026 бот
+// склеил их в одну озвучку). Заголовок ролика — короткая строка с номером модели без точки
+// в конце, отбитая пустыми строками сверху и снизу.
+export function splitSections(text) {
+  const lines = text.split("\n");
+  const isHeader = (i) => {
+    const s = lines[i].trim();
+    return (
+      s && s.length <= 50 && /\d{2,}/.test(s) && !/[.!?:;,]$/.test(s) &&
+      (i === 0 || !lines[i - 1].trim()) && i + 1 < lines.length && !lines[i + 1].trim()
+    );
+  };
+  const starts = lines.map((_, i) => i).filter(isHeader);
+  if (starts.length < 2) return [text];
+  if (lines.slice(0, starts[0]).some((l) => l.trim())) starts.unshift(0);
+  return starts.map((s, k) => lines.slice(s, starts[k + 1] ?? lines.length).join("\n").trim()).filter(Boolean);
+}
+
 const LANG_MARK =
   /^(язык|language|lang|озвучка|озвучить|voice[- ]?over|текст для озвучки)?\s*[:\-–]?\s*(на\s+)?(english|eng|en|английск\w*|англ\.?|russian|rus|ru|русск\w*|german|deutsch|de|немецк\w*|french|fr|французск\w*|spanish|es|испанск\w*|italian|it|итальянск\w*|kazakh|kz|казахск\w*|uzbek|uz|узбекск\w*)(\s+(язык|language|version|версия))?\s*[.:!]?$/i;
 
@@ -91,17 +109,41 @@ export async function pickVoiceText(paras, selector) {
   return { ...pick, text: pick.voice.map((i) => paras[i]).join("\n") };
 }
 
-// Как Liam читает правильно — выверено на озвучках B.Well (24.10.2026)
+const ONES = "zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen".split(" ");
+const TENS = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"];
+export function hundredsInWords(n) {
+  const rest = n % 100;
+  const tail = rest < 20 ? ONES[rest] : TENS[Math.floor(rest / 10)] + (rest % 10 ? "-" + ONES[rest % 10] : "");
+  return `${ONES[Math.floor(n / 100)]} hundred${rest ? " " + tail : ""}`;
+}
+
+// Конец строки без знака — пункт списка. Без запятых Liam склеивает соседние пункты
+// («Accessories bag / Instruction Manual» → «accessories, bag instruction manual»).
+function punctuateLists(text) {
+  const lines = text.split("\n");
+  const bare = (s) => s.trim() && !/[.!?:;,…–—-]$/.test(s.trim());
+  return lines
+    .map((l, i) => (bare(l) ? l.trimEnd() + (i < lines.length - 1 && bare(lines[i + 1]) ? "," : ".") : l))
+    .join("\n");
+}
+
+// Как Liam читает правильно — выверено на озвучках B.Well (24.10–11.11.2026)
 export function pronounce(text, language = "en") {
   if (!/^en/.test(language)) return text;
-  return text
-    .replace(/\bB\.\s?Well\b/g, "Be Well")
-    .replace(/\bMED-(?=\d)/g, "Med-") // капсом читает по буквам «эм-и-ди»
-    .replace(/\bPRO\b/g, "Pro") // и тут по буквам «пи-эр-о»
-    .replace(/\b(\d+)\s*[–—-]\s*(\d+)\s*cm\b/g, "$1 to $2 cm") // без «to» читает «twenty-two forty-two»
-    .replace(/\bcm\b/g, "centimeters") // «cm» проглатывает или читает как «seven mm»
-    .replace(/\bAAA\b/g, "triple-A")
-    .replace(/\bAVG\b/g, "A-V-G");
+  return punctuateLists(
+    text
+      .replace(/\bB\.\s?Well\b/g, "Be Well")
+      .replace(/\bMED-(?=\d)/g, "Med-") // капсом читает по буквам «эм-и-ди»
+      .replace(/\bPRO\b/g, "Pro") // и тут по буквам «пи-эр-о»
+      // трёхзначный номер модели — целиком: 915 звучал как «nine fifty», Зира приняла «nine hundred fifteen»
+      .replace(/\b([A-Za-z]{1,4})-(\d{3})\b/g, (_, p, n) => `${/^[A-Z]{2,4}$/.test(p) ? p.split("").join("-") : p} ${hundredsInWords(Number(n))}`)
+      .replace(/\b(\d+)\s*[–—-]\s*(\d+)\s*cm\b/g, "$1 to $2 cm") // без «to» читает «twenty-two forty-two»
+      .replace(/\bcm\b/g, "centimeters") // «cm» проглатывает или читает как «seven mm»
+      .replace(/\b(\d+)\s*ml\b(?=\s+[a-z])/g, "$1-milliliter") // «300 ml water tank» читал «three hundred mil»
+      .replace(/\bml\b/g, "milliliters")
+      .replace(/\bAAA\b/g, "triple-A")
+      .replace(/\bAVG\b/g, "A-V-G")
+  );
 }
 
 function chunks(text, max = TTS_CHUNK) {
@@ -203,11 +245,19 @@ export function registerVoiceover(bot, { getOwnerId, dir, selectVoiceText, capti
       );
       return true;
     }
-    const paras = paragraphs(source);
-    if (!paras.length) {
+    if (!paragraphs(source).length) {
       await toOwner(`📨 ${who} прислала док на озвучку, но он пустой.`);
       return true;
     }
+    const sections = splitSections(source);
+    for (const [n, section] of sections.entries()) {
+      await askSection(msg, connId, paragraphs(section), sections.length > 1 ? ` (ролик ${n + 1} из ${sections.length})` : "");
+    }
+    return true;
+  }
+
+  // Отдельное задание на каждый ролик из дока: свои два варианта, своя отправка
+  async function askSection(msg, connId, paras, part) {
     const pick = await pickVoiceText(paras, selectVoiceText);
     const id = Math.random().toString(36).slice(2, 8);
     const job = {
@@ -229,13 +279,12 @@ export function registerVoiceover(bot, { getOwnerId, dir, selectVoiceText, capti
     const mins = Math.max(1, Math.round(job.text.length / 1000));
     const skipped = job.excluded.length ? `\nНе озвучиваю: ${job.excluded.map((p) => `«${esc(clip(p, 60))}»`).join(", ")}` : "";
     await toOwner(
-      `📨 <b>${esc(job.who)} прислала текст на озвучку</b>${job.title ? ` — «${esc(job.title)}»` : ""}\n` +
+      `📨 <b>${esc(job.who)} прислала текст на озвучку</b>${job.title ? ` — «${esc(job.title)}»` : ""}${part}\n` +
         `Язык: ${esc(job.language)}, ${job.text.length} знаков, это примерно ${mins} мин.${skipped}\n\n` +
         `<i>${esc(clip(job.text, 350))}</i>\n\n` +
         `Делаю как обычно: ${VOICE.name}, два варианта, сначала тебе послушать.`,
       kb([[{ text: "🎙 Озвучить", callback_data: `vo:go:${id}` }, { text: "Не надо", callback_data: `vo:no:${id}` }]])
     );
-    return true;
   }
 
   async function generate(job) {

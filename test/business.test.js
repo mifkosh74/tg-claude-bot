@@ -22,6 +22,24 @@ const DOC = [
   'The "AVG" symbol will be displayed.',
 ].join("\r\n");
 
+// два ролика в одном доке, как 10.11.2026: инструкция к ирригатору и распаковка небулайзера
+const TWO_DOC = [
+  "EU-med-915",
+  "",
+  "",
+  "The B.Well MED-915 oral irrigator is a professional device for dental and gum care.",
+  "B.Well – making millions of families happier.",
+  "",
+  "",
+  "TH-139 распаковка",
+  "",
+  "",
+  "The compact TH-139 mesh nebulizer is easy to take with you.",
+  "The TH-139 kit includes: ",
+  "Accessories bag",
+  "Instruction Manual",
+].join("\n");
+
 // --- заглушка Google Docs и ElevenLabs ---
 const ttsTexts = [];
 const server = http.createServer(async (req, res) => {
@@ -31,6 +49,10 @@ const server = http.createServer(async (req, res) => {
   if (url.pathname === "/document/d/OPEN_DOC_1234567890abcdef/export") {
     res.setHeader("content-type", "text/plain; charset=utf-8");
     return res.end("﻿" + DOC);
+  }
+  if (url.pathname === "/document/d/TWO_ROLIKA_1234567890abcdef/export") {
+    res.setHeader("content-type", "text/plain; charset=utf-8");
+    return res.end("﻿" + TWO_DOC);
   }
   if (url.pathname.startsWith("/document/d/")) {
     res.setHeader("content-type", "text/html");
@@ -52,7 +74,7 @@ process.env.ELEVEN_API_BASE = base;
 process.env.ELEVENLABS_API_KEY = "el-test-key";
 
 const { registerBusiness, describe: describeMsg } = await import("../business.js");
-const { registerVoiceover, pronounce, pickVoiceText, paragraphs, buildCaption, docIdFrom } = await import(
+const { registerVoiceover, pronounce, pickVoiceText, paragraphs, buildCaption, docIdFrom, splitSections, hundredsInWords } = await import(
   "../voiceover.js"
 );
 
@@ -273,6 +295,25 @@ test("закрытый док — Николаю просьба открыть �
   assert.ok(await waitFor(() => ownerTexts().some((t) => /открыть его не вышло/.test(t))));
 });
 
+test("два ролика в одном доке — два отдельных задания, у каждого свой заголовок", async () => {
+  const before = ownerTexts().length;
+  const nPicks = picks.length;
+  await dispatch(bmsg(zira, zira, "https://docs.google.com/document/d/TWO_ROLIKA_1234567890abcdef/edit?usp=sharing"));
+  assert.ok(await waitFor(() => ownerTexts().slice(before).filter((t) => /прислала текст на озвучку/.test(t)).length === 2));
+  const asks = ownerTexts().slice(before).filter((t) => /прислала текст на озвучку/.test(t));
+  assert.match(asks[0], /\(ролик 1 из 2\)/);
+  assert.match(asks[1], /\(ролик 2 из 2\)/);
+  assert.match(picks[nPicks], /^\[1\] EU-med-915\n\[2\] The B\.Well MED-915/);
+  assert.match(picks[nPicks + 1], /^\[1\] TH-139 распаковка\n\[2\] The compact TH-139/);
+  assert.doesNotMatch(picks[nPicks], /TH-139/, "распаковка не попадает в инструкцию");
+});
+
+test("разбиение дока: заголовок с номером между пустыми строками, иначе один ролик", () => {
+  assert.equal(splitSections(TWO_DOC).length, 2);
+  assert.equal(splitSections(DOC.replace(/\r\n/g, "\n")).length, 1, "один заголовок в начале — один ролик");
+  assert.equal(splitSections("The kit includes:\n\nStorage case\n\nUser manual").length, 1, "пункты списка без номеров — не заголовки");
+});
+
 test("без Клода: пометка языка и заголовок отсекаются запасным разбором", async () => {
   const paras = paragraphs("EU-med 59-89\n\nEnglish\nHello there, this is the text.\nSecond line.");
   const pick = await pickVoiceText(paras, async () => "не JSON");
@@ -283,9 +324,16 @@ test("без Клода: пометка языка и заголовок отс�
 
 test("мелочи: произношение только для английского, подпись без характера при равной длине, id дока", () => {
   assert.equal(pronounce("B.Well MED-130", "ru"), "B.Well MED-130");
-  assert.equal(pronounce("B.Well MED-130, AVG", "en"), "Be Well Med-130, A-V-G");
-  assert.equal(pronounce("The PRO-22 kit, cuff 22–42 cm or 36 cm", "en"), "The Pro-22 kit, cuff 22 to 42 centimeters or 36 centimeters");
+  assert.equal(pronounce("B.Well MED-130, AVG", "en"), "Be Well Med one hundred thirty, A-V-G.");
+  assert.equal(pronounce("The PRO-22 kit, cuff 22–42 cm or 36 cm", "en"), "The Pro-22 kit, cuff 22 to 42 centimeters or 36 centimeters.");
   assert.equal(pronounce("USB Type-C, PRO-22", "ru"), "USB Type-C, PRO-22");
+  // 10–11.11.2026: «915» звучал как «nine fifty», Зира приняла «nine hundred fifteen»
+  assert.equal(pronounce("The B.Well MED-915 oral irrigator.", "en"), "The Be Well Med nine hundred fifteen oral irrigator.");
+  assert.equal(pronounce("The compact TH-139 mesh nebulizer.", "en"), "The compact T-H one hundred thirty-nine mesh nebulizer.");
+  assert.equal(pronounce("Med-2000 and PRO-20 stay.", "en"), "Med-2000 and Pro-20 stay.");
+  assert.equal(pronounce("Periodontal nozzle\n300 ml water tank\nUser manual", "en"), "Periodontal nozzle,\n300-milliliter water tank,\nUser manual.");
+  assert.equal(pronounce("The kit includes: \nAccessories bag\nInstruction Manual\nPlace it in the bag.", "en"), "The kit includes: \nAccessories bag,\nInstruction Manual.\nPlace it in the bag.");
+  assert.deepEqual([915, 139, 300, 110].map(hundredsInWords), ["nine hundred fifteen", "one hundred thirty-nine", "three hundred", "one hundred ten"]);
   const cap = buildCaption("", [{ duration: 60 }, { duration: 61 }]);
   assert.match(cap, /^Привет! Озвучка готова/);
   assert.match(cap, /\nv1, 1:00\nv2, 1:01\n\n🤖/);

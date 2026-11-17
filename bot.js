@@ -3,6 +3,7 @@ import { query } from "@anthropic-ai/claude-agent-sdk";
 import { registerCrosspost } from "./crosspost-inbox.js";
 import { registerBusiness } from "./business.js";
 import { registerVoiceover } from "./voiceover.js";
+import { registerStories } from "./stories.js";
 import { readFileSync, writeFileSync, existsSync } from "fs";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
@@ -218,6 +219,10 @@ bot.command("reset", async (ctx) => {
   saveState();
   await ctx.reply("Контекст этого чата очищен.");
 });
+
+// Сторис от имени Николая: запоминаем id бизнес-подключения для локального скрипта.
+// До registerBusiness, потому что тот business-обновления дальше не пропускает.
+registerStories(bot, { getOwnerId: () => state.ownerId, dir: __dirname });
 
 // Лички через Telegram Business: сводка «кто ждёт ответа» и озвучки для Зиры.
 // Регистрируется до обработчиков текста и пересылок: business-обновления дальше не уходят.
